@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+*/session.json
+agents/*/runtime.json
+agents/*/memory/*.md
+agents/*/tasks/
+agents/*/state/
+agents/*/deliverables/
+agents/*/projects/
+agents/*/specs/
+agents/*/wake/
+data/runner-events.log
+data/usage.jsonl
+.setup-state
+
+# B.1 — release-script staging dir (built per-release, never committed)
+/dist-pkg/
+
+# config/agents.local.yaml — per-installation agent overlay. Gitignored
+# so `git pull` / `hive update` can never delete or change a Hive
+# operator's agent set. See docs and `hive config migrate-agents`.
+config/agents.local.yaml
+config/config.yaml.backup-*
+config/users.local.yaml
+
+# shared/exchange — ephemeral inter-agent hand-off files. The directory and
+# its README.md are tracked; everything else is throwaway.
+shared/exchange/*
+!shared/exchange/README.md

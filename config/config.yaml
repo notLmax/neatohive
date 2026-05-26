@@ -1,0 +1,49 @@
+# Neato Hive — Configuration
+
+# Default model for all agents
+# (dropped the [1m] suffix 2026-05-07 — 200K standard window compacts ~5x sooner
+# than 1M extended, lower per-turn token cost. 500K isn't a real option;
+# Claude Code only exposes default 200K or extended 1M.)
+model: claude-opus-4-7
+
+# Agent definitions
+# Each agent gets its own Discord bot, its own channel, its own PM2 process.
+# Launch: pm2 start dist/index.js --name <agent-name> -- --agent <agent-name>
+agents:
+  house-md:
+    channels:
+      - house-md
+    behavior_dir: agents/house-md
+    # v1.5.8 — required for delegation/wake auto-resume after machine restart.
+    # Without it, hive doctor reports a WARN and runner-events miss boot beacons.
+    announce_on_boot: true
+
+# Codex MCP (for agents with coding_backend: codex)
+codex:
+  enabled: true
+  command: npx
+  args: ["-y", "codex", "mcp-server"]
+
+# Safety
+safety:
+  blocked_commands:
+    - "rm -rf /"
+    - "rm -rf ~"
+    - "rm -rf /*"
+    - "sudo rm"
+    - "mkfs"
+    - "dd if="
+    - "shutdown"
+    - "reboot"
+    - ":(){:|:&};:"
+
+  allowed_paths:
+    - ~/projects
+    - ~/neato-hive
+    - /tmp
+
+  protected_paths:
+    - ~/.ssh
+    - ~/.codex
+    - /etc
+    - /usr

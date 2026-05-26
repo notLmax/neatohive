@@ -1,0 +1,11 @@
+# config/users.local.yaml — user identity table (gitignored).
+# Each user can have multiple Discord IDs (e.g. one human, two accounts).
+# The user with primary: true is the EscalateToOwner target.
+
+users:
+  - id: owner
+    name: YourName
+    primary: true
+    discord_ids:
+      - "YOUR_DISCORD_ID_HERE"
+      # - "SECOND_DISCORD_ID_IF_YOU_HAVE_ONE"

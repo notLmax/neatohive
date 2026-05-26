@@ -1,0 +1,70 @@
+# config/agents.local.yaml — your local agent definitions.
+#
+# This file is OPTIONAL and GITIGNORED.
+#
+# When present, agents listed here are merged with (and override) the
+# committed agents from config/config.yaml. The overlay exists so that
+# `git pull` and `hive update` cannot delete or silently change your
+# agent set on upgrade.
+#
+# To start using it:
+#   1. Copy this file to config/agents.local.yaml.
+#   2. Add your agents below.
+#   3. Restart the affected agent processes (`pm2 restart <agent>`).
+#
+# Or, if you already have agents in config/config.yaml from a previous
+# installation, run the one-shot migration:
+#
+#     hive config migrate-agents
+#
+# That command moves your agents into config/agents.local.yaml and backs
+# up the original config.yaml.
+#
+# Two accepted shapes:
+#
+# Shape A (matches the committed config layout — recommended):
+#
+# agents:
+#   atlas:
+#     channels:
+#       - atlas
+#       - hivemind
+#     behavior_dir: agents/atlas
+#     model: claude-opus-4-7
+#
+#   glados:
+#     channels:
+#       - glados
+#       - hivemind
+#     behavior_dir: agents/glados
+#     model: claude-sonnet-4-6
+#
+# Shape B (top-level agent map — also accepted):
+#
+# atlas:
+#   channels:
+#     - atlas
+#     - hivemind
+#   behavior_dir: agents/atlas
+#
+# glados:
+#   channels:
+#     - glados
+#     - hivemind
+#   behavior_dir: agents/glados
+#
+# ---------------------------------------------------------------------------
+#
+# `house-md` is the canonical seed agent in the committed config.yaml — every
+# Hive ships with it. You don't need to redefine it here unless you're
+# customizing its channels or model.
+
+agents:
+  # Add your agents here. Example:
+  #
+  # atlas:
+  #   channels:
+  #     - atlas
+  #     - hivemind
+  #   behavior_dir: agents/atlas
+  #   model: claude-opus-4-7

@@ -1,0 +1,129 @@
+# Cloud Build pipeline for hive-releases-api (FastAPI on Cloud Run, neato-os).
+#
+# Trigger: push-to-main on anthonyconnelly/neato-hive (auto-fired by hive-releases-api-deploy).
+#
+# Steps:
+#   1. Build Docker image from services/hive-releases-api/, tag with $COMMIT_SHA + latest.
+#   2. Push both tags to Artifact Registry.
+#   3. Run Alembic migrations against Cloud SQL.
+#   4. Deploy Cloud Run service hive-releases-api in us-central1.
+#   5. Bind allUsers -> run.invoker (Neato GCP org policy strips --allow-unauthenticated; explicit binding required).
+#
+# Future leaves:
+#   - A.5: insert migrate step (alembic upgrade head) between push and deploy when DB schema lands.
+#   - v1.5.x: add CLERK_SECRET_KEY + CLERK_WEBHOOK_SECRET to --set-secrets when middleware activates.
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/neato-os/neato-os/hive-releases-api:$COMMIT_SHA
+      - -t
+      - us-central1-docker.pkg.dev/neato-os/neato-os/hive-releases-api:latest
+      - services/hive-releases-api
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - us-central1-docker.pkg.dev/neato-os/neato-os/hive-releases-api
+
+  - id: migrate
+    name: us-central1-docker.pkg.dev/neato-os/neato-os/hive-releases-api:$COMMIT_SHA
+    entrypoint: bash
+    secretEnv: ['DB_PASSWORD']
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p /workspace/cloudsql /workspace/bin
+        python - <<'PY'
+        import os
+        import stat
+        import urllib.request
+
+        target = "/workspace/bin/cloud-sql-proxy"
+        if not os.path.exists(target):
+            url = "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.18.3/cloud-sql-proxy.linux.amd64"
+            urllib.request.urlretrieve(url, target)
+            os.chmod(
+                target,
+                os.stat(target).st_mode
+                | stat.S_IXUSR
+                | stat.S_IXGRP
+                | stat.S_IXOTH,
+            )
+        PY
+        /workspace/bin/cloud-sql-proxy --unix-socket=/workspace/cloudsql neato-os:us-central1:neato-os-db &
+        PROXY_PID=$$!
+        cleanup() {
+          kill "$$PROXY_PID" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+        for i in {1..20}; do
+          [ -S /workspace/cloudsql/neato-os:us-central1:neato-os-db/.s.PGSQL.5432 ] && break
+          sleep 0.5
+        done
+        [ -S /workspace/cloudsql/neato-os:us-central1:neato-os-db/.s.PGSQL.5432 ] || {
+          echo "proxy socket never appeared"
+          exit 1
+        }
+        cd /app
+        APP_ENV=development \
+        DB_USER=hive_releases_user \
+        DB_NAME=hive_releases \
+        DB_PASSWORD="$$DB_PASSWORD" \
+        CLOUD_SQL_CONNECTION_NAME=neato-os:us-central1:neato-os-db \
+        CLOUD_SQL_SOCKET_DIR=/workspace/cloudsql \
+          alembic upgrade head
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - hive-releases-api
+      - --image=us-central1-docker.pkg.dev/neato-os/neato-os/hive-releases-api:$COMMIT_SHA
+      - --region=us-central1
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+      - --memory=512Mi
+      - --cpu=1
+      - --min-instances=0
+      - --max-instances=3
+      - --service-account=hive-releases-api@neato-os.iam.gserviceaccount.com
+      - --add-cloudsql-instances=neato-os:us-central1:neato-os-db
+      - --set-env-vars=APP_ENV=production,DB_NAME=hive_releases,CLOUD_SQL_CONNECTION_NAME=neato-os:us-central1:neato-os-db,CLOUD_SQL_SOCKET_DIR=/cloudsql
+      - --set-secrets=DB_PASSWORD=hive-releases-db-password:latest
+
+  # Workaround for Neato GCP org policy: --allow-unauthenticated above is silently
+  # stripped, leaving the service with empty IAM bindings. Bind allUsers -> run.invoker
+  # explicitly post-deploy. Mirrors lore C.0 / D.3 pattern.
+  - id: bind-public-invoker
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - add-iam-policy-binding
+      - hive-releases-api
+      - --region=us-central1
+      - --member=allUsers
+      - --role=roles/run.invoker
+
+images:
+  - us-central1-docker.pkg.dev/neato-os/neato-os/hive-releases-api:$COMMIT_SHA
+  - us-central1-docker.pkg.dev/neato-os/neato-os/hive-releases-api:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/neato-os/secrets/hive-releases-db-password/versions/latest
+      env: DB_PASSWORD

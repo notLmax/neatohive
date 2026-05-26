@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in - Hive Dashboard</title>
+  <link rel="stylesheet" href="/css/dashboard.css">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <h1>Hive Dashboard</h1>
+    <p class="muted">Paste your dashboard token to sign in.</p>
+    <p class="muted small">Find it via <code>hive dashboard token</code> on the host machine.</p>
+    <div id="login-banner" class="login-banner" hidden></div>
+    <form id="login-form" autocomplete="off">
+      <label for="token-input">Dashboard token</label>
+      <input
+        id="token-input"
+        name="token"
+        type="password"
+        autocomplete="off"
+        spellcheck="false"
+        autocapitalize="off"
+        placeholder="64 hex characters"
+        required
+        minlength="64"
+        maxlength="64"
+        pattern="[a-f0-9]{64}"
+      >
+      <button type="submit">Save &amp; continue</button>
+      <p id="login-error" class="error" hidden></p>
+    </form>
+  </div>
+
+  <script type="module">
+    import { setToken, isValidTokenFormat } from '/js/auth.js';
+
+    const params = new URLSearchParams(window.location.search);
+    const returnTo = params.get('return') || '/';
+    const expired = params.get('expired') === '1';
+    const banner = document.getElementById('login-banner');
+    const form = document.getElementById('login-form');
+    const input = document.getElementById('token-input');
+    const error = document.getElementById('login-error');
+
+    if (expired) {
+      banner.textContent = 'Session expired or token rejected. Please sign in again.';
+      banner.hidden = false;
+    }
+
+    function showError(message) {
+      error.textContent = message;
+      error.hidden = false;
+    }
+
+    function clearError() {
+      error.textContent = '';
+      error.hidden = true;
+    }
+
+    function getSafeReturnPath(candidate) {
+      return candidate.startsWith('/') && !candidate.startsWith('//') ? candidate : '/';
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      clearError();
+
+      const token = input.value;
+      if (!isValidTokenFormat(token)) {
+        showError('Token must be 64 hex characters (a-f, 0-9).');
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/status', {
+          headers: { Authorization: 'Bearer ' + token },
+        });
+
+        if (response.status === 401) {
+          showError('Token rejected by the dashboard.');
+          return;
+        }
+
+        if (!response.ok) {
+          showError('Dashboard returned an error: ' + response.status);
+          return;
+        }
+      } catch (err) {
+        showError('Could not reach dashboard: ' + err.message);
+        return;
+      }
+
+      setToken(token);
+      window.location.href = getSafeReturnPath(returnTo);
+    });
+  </script>
+</body>
+</html>

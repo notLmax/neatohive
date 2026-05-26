@@ -1,0 +1,3935 @@
+#!/usr/bin/env bash
+#
+# hive — Neato Hive CLI
+#
+# Usage: hive <command> [arguments]
+#
+# Manages agents, sessions, updates, and diagnostics for a Neato Hive installation.
+
+set -uo pipefail
+
+get_version() {
+  if [ -f "$HIVE_ROOT/package.json" ]; then
+    python3 -c "import json; print(json.load(open('$HIVE_ROOT/package.json')).get('version', 'unknown'))" 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Resolve HIVE_ROOT — works even when called via npm-link symlink
+# ---------------------------------------------------------------------------
+resolve_real_path() {
+  # Use Python to resolve the full symlink chain (works on macOS without coreutils)
+  python3 -c "import os; print(os.path.realpath('$1'))"
+}
+
+SCRIPT_PATH="$(resolve_real_path "$0")"
+HIVE_ROOT="$(dirname "$(dirname "$SCRIPT_PATH")")"
+
+CONFIG_FILE="$HIVE_ROOT/config/config.yaml"
+# Gitignored overlay where users keep their actual fleet definitions so
+# `git pull` / `hive update` can never wipe the agent set. The TS runtime
+# merges base + overlay; the bash helpers below must too.
+CONFIG_OVERLAY_FILE="$HIVE_ROOT/config/agents.local.yaml"
+ENV_FILE="$HIVE_ROOT/.env"
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+info()    { echo -e "${BLUE}[hive]${RESET} $*"; }
+success() { echo -e "${GREEN}[hive]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[hive]${RESET} $*"; }
+error()   { echo -e "${RED}[hive]${RESET} $*" >&2; }
+header()  { echo -e "\n${BOLD}$*${RESET}"; }
+
+# Cross-platform file hash (macOS `md5 -q`, Linux `md5sum`). Used for
+# detecting lockfile drift on update. Empty string if neither tool exists
+# or the file is missing.
+_hash_file() {
+  local f="$1"
+  [ -f "$f" ] || { echo ""; return; }
+  if command -v md5 >/dev/null 2>&1; then
+    md5 -q "$f" 2>/dev/null
+  elif command -v md5sum >/dev/null 2>&1; then
+    md5sum "$f" 2>/dev/null | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
+# Normalize agent name: join extra words with hyphens, lowercase
+# "son of anton" → "son-of-anton"
+normalize_agent() {
+  echo "$*" | tr ' ' '-' | tr '[:upper:]' '[:lower:]'
+}
+
+# Files that contribute agent definitions, in PRECEDENCE order (first wins
+# on key conflicts — matches the TS runtime's overlay-takes-precedence
+# semantics documented in config/agents.local.yaml).
+_agent_config_files() {
+  [ -f "$CONFIG_OVERLAY_FILE" ] && echo "$CONFIG_OVERLAY_FILE"
+  [ -f "$CONFIG_FILE" ] && echo "$CONFIG_FILE"
+}
+
+# List all agent names from every contributing config file, deduped.
+# Pre-v1.3.8 this only read $CONFIG_FILE — agents in agents.local.yaml
+# were invisible to the bash CLI even though the runtime saw them.
+list_agents() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    awk '
+      /^agents:/ { in_agents=1; next }
+      in_agents && /^[a-z]/ { in_agents=0 }
+      in_agents && /^  [a-z]/ {
+        sub(/:.*/, "")
+        gsub(/^[ \t]+/, "")
+        print
+      }
+    ' "$f" 2>/dev/null
+  done < <(_agent_config_files) | awk '!seen[$0]++'
+}
+
+# Check if an agent exists in any config file.
+agent_exists() {
+  list_agents | grep -qx "$1"
+}
+
+# Look up a single scalar field for an agent (e.g. `behavior_dir`,
+# `coding_backend`, `model`). Checks overlay first, falls back to base.
+# Empty string if no contributing file defines the agent + key.
+_agent_scalar() {
+  local agent="$1" key="$2" f val
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    val=$(awk -v k="$key" "/^  ${agent}:/{found=1; next} found && /^  [a-z]/{exit} found && \$1 == k\":\"{sub(/^[^:]+: */, \"\"); print; exit}" "$f" 2>/dev/null)
+    if [ -n "$val" ]; then
+      echo "$val"
+      return
+    fi
+  done < <(_agent_config_files)
+}
+
+# Get behavior dir for an agent (absolute path).
+agent_behavior_dir() {
+  local agent="$1" dir
+  dir=$(_agent_scalar "$agent" "behavior_dir")
+  echo "$HIVE_ROOT/$dir"
+}
+
+# Get channel(s) for an agent. Returns the FIRST file's channel list that
+# defines the agent — overlay-wins. Pre-v1.3.8 this only read $CONFIG_FILE.
+agent_channels() {
+  local agent="$1" f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    local out
+    out=$(awk "/^  ${agent}:/{found=1; next} found && /^  [a-z]/ && !/^  ${agent}:/{found=0} found && /- /{gsub(/^.*- /,\"\"); print}" "$f" 2>/dev/null)
+    if [ -n "$out" ]; then
+      echo "$out"
+      return
+    fi
+  done < <(_agent_config_files)
+}
+
+# Get coding backend for an agent (e.g. "codex", "claude"). Empty if unset.
+agent_coding_backend() {
+  _agent_scalar "$1" "coding_backend"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_help() {
+  echo -e "${BOLD}Neato Hive CLI v$(get_version)${RESET}"
+  echo ""
+  echo -e "${BOLD}Usage:${RESET} hive <command> [arguments]"
+  echo ""
+  echo -e "${BOLD}Agent Management${RESET}"
+  echo "  status                     Show all agents and their PM2 status"
+  echo "  list                       List all configured agents"
+  echo "  info <agent>               Show detailed info for an agent"
+  echo "  start <agent|all>          Start an agent (or all agents)"
+  echo "  stop <agent|all>           Stop an agent (or all agents)"
+  echo "  restart <agent|all>        Restart an agent (or all agents)"
+  echo "  logs <agent> [lines]       View agent logs (default: 30 lines)"
+  echo ""
+  echo -e "${BOLD}Sessions${RESET}"
+  echo "  newsession <agent>         Clear an agent's session (next message starts fresh)"
+  echo "  session <agent>            Show current session info for an agent"
+  echo ""
+  echo -e "${BOLD}Build & Update${RESET}"
+  echo "  build                      Compile TypeScript (npm run build)"
+  echo "  update                     Pull latest framework code, rebuild, restart all"
+  echo "  update --check             Report local vs remote version without modifying anything"
+  echo "                             (does run 'git fetch' to refresh refs — no working-tree changes)"
+  echo "  bootstrap                  Reconcile PM2 daemons against ecosystem.config.cjs (idempotent)"
+  echo "  version                    Show Hive CLI and framework version"
+  echo ""
+  echo -e "${BOLD}Diagnostics${RESET}"
+  echo "  doctor                     Run health checks on the entire Hive"
+  echo "  doctor --fix-tailscale     Opt in to expose the dashboard via Tailscale Serve"
+  echo "  doctor --fix-setup         Diagnose and fix a stuck setup wizard (interactive)"
+  echo "  env                        Show .env status (which keys are set, no values)"
+  echo "  config                     Show parsed config summary"
+  echo ""
+  echo -e "${BOLD}Examples${RESET}"
+  echo "  hive status"
+  echo "  hive start dinesh"
+  echo "  hive restart all"
+  echo "  hive logs son-of-anton 50"
+  echo "  hive newsession bobby-axelrod"
+  echo "  hive doctor"
+  echo "  hive doctor --fix-tailscale"
+  echo "  hive doctor --fix-setup"
+}
+
+cmd_version() {
+  echo -e "${BOLD}Neato Hive${RESET} v$(get_version)"
+  echo -e "${DIM}Root: ${HIVE_ROOT}${RESET}"
+
+  # Show git info if available
+  if [ -d "$HIVE_ROOT/.git" ]; then
+    local branch commit
+    branch=$(cd "$HIVE_ROOT" && git branch --show-current 2>/dev/null || echo "unknown")
+    commit=$(cd "$HIVE_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo -e "${DIM}Branch: ${branch} (${commit})${RESET}"
+  fi
+
+  # Show node version
+  echo -e "${DIM}Node: $(node --version 2>/dev/null || echo "not found")${RESET}"
+}
+
+cmd_status() {
+  header "Hive Status"
+  pm2 status 2>/dev/null || error "PM2 is not running. Install with: npm install -g pm2"
+}
+
+cmd_list() {
+  header "Configured Agents"
+  echo ""
+  printf "  ${BOLD}%-20s %-25s %-15s${RESET}\n" "AGENT" "CHANNEL(S)" "CODING BACKEND"
+  echo "  $(printf '%.0s─' {1..60})"
+
+  for agent in $(list_agents); do
+    local channels coding_backend
+    channels=$(agent_channels "$agent" | paste -sd, -)
+    coding_backend=$(agent_coding_backend "$agent")
+    [ -z "$coding_backend" ] && coding_backend="—"
+    printf "  %-20s %-25s %-15s\n" "$agent" "$channels" "$coding_backend"
+  done
+  echo ""
+}
+
+cmd_info() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive info <agent>"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found in config. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  local bdir
+  bdir=$(agent_behavior_dir "$agent")
+
+  header "Agent: $agent"
+
+  # Channel(s)
+  echo -e "\n${BOLD}Channel(s):${RESET}"
+  agent_channels "$agent" | while read -r ch; do echo "  #$ch"; done
+
+  # Behavior files
+  echo -e "\n${BOLD}Behavior Files:${RESET} ${DIM}($bdir)${RESET}"
+  if [ -d "$bdir" ]; then
+    for f in "$bdir"/*.md; do
+      [ -f "$f" ] && echo "  $(basename "$f")"
+    done
+  else
+    warn "  Directory not found!"
+  fi
+
+  # Memory files
+  local memdir="$bdir/memory"
+  echo -e "\n${BOLD}Daily Memory Files:${RESET}"
+  if [ -d "$memdir" ]; then
+    local count
+    count=$(ls "$memdir"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$count" -gt 0 ]; then
+      echo "  $count file(s)"
+      ls -1 "$memdir"/*.md 2>/dev/null | tail -5 | while read -r f; do
+        echo "  $(basename "$f")"
+      done
+      [ "$count" -gt 5 ] && echo "  ${DIM}... and $((count - 5)) more${RESET}"
+    else
+      echo "  ${DIM}(none yet)${RESET}"
+    fi
+  else
+    echo "  ${DIM}(no memory directory)${RESET}"
+  fi
+
+  # Session
+  local session_file="$bdir/session.json"
+  echo -e "\n${BOLD}Session:${RESET}"
+  if [ -f "$session_file" ]; then
+    local sid updated
+    sid=$(python3 -c "import json; d=json.load(open('$session_file')); print(d.get('sessionId','')[:12])" 2>/dev/null || echo "")
+    updated=$(python3 -c "import json; d=json.load(open('$session_file')); print(d.get('updatedAt','unknown'))" 2>/dev/null || echo "unknown")
+    if [ -n "$sid" ] && [ "$sid" != "" ]; then
+      echo "  ID: ${sid}..."
+      echo "  Updated: $updated"
+    else
+      echo "  ${DIM}(no active session)${RESET}"
+    fi
+  else
+    echo "  ${DIM}(no session file)${RESET}"
+  fi
+
+  # PM2 status
+  echo -e "\n${BOLD}PM2 Process:${RESET}"
+  local pm2_info
+  pm2_info=$(pm2 jlist 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for p in data:
+    if p['name'] == '$agent':
+        status = p['pm2_env']['status']
+        uptime = p['pm2_env'].get('pm_uptime', 0)
+        restarts = p['pm2_env'].get('restart_time', 0)
+        pid = p.get('pid', 'N/A')
+        print(f'  Status: {status}')
+        print(f'  PID: {pid}')
+        print(f'  Restarts: {restarts}')
+        sys.exit(0)
+print('  Not running in PM2')
+" 2>/dev/null || echo "  Could not query PM2")
+  echo "$pm2_info"
+  echo ""
+}
+
+cmd_start() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive start <agent|all>"
+    return 1
+  fi
+
+  if [ "$agent" = "all" ]; then
+    header "Starting all agents"
+    for a in $(list_agents); do
+      _start_agent "$a"
+    done
+    pm2 save --force 2>/dev/null
+    success "All agents started."
+    return 0
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  _start_agent "$agent"
+  pm2 save --force 2>/dev/null
+}
+
+_start_agent() {
+  local agent="$1"
+  local token_var
+  token_var="DISCORD_BOT_TOKEN_$(echo "$agent" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+
+  # Check if token exists in .env
+  if ! grep -q "^${token_var}=" "$ENV_FILE" 2>/dev/null; then
+    error "$agent: Missing $token_var in .env"
+    return 1
+  fi
+
+  # Check if already running
+  if pm2 describe "$agent" &>/dev/null; then
+    warn "$agent: Already registered in PM2. Use 'hive restart $agent' instead."
+    return 0
+  fi
+
+  info "Starting $agent..."
+  (cd "$HIVE_ROOT" && pm2 start dist/index.js --name "$agent" -- --agent "$agent")
+  success "$agent: Started."
+}
+
+cmd_stop() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive stop <agent|all>"
+    return 1
+  fi
+
+  if [ "$agent" = "all" ]; then
+    header "Stopping all agents"
+    pm2 stop all 2>/dev/null
+    pm2 save --force 2>/dev/null
+    success "All agents stopped."
+    return 0
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  info "Stopping $agent..."
+  pm2 stop "$agent" 2>/dev/null || warn "$agent not found in PM2."
+  pm2 save --force 2>/dev/null
+  success "$agent: Stopped."
+}
+
+cmd_restart() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive restart <agent|all>"
+    return 1
+  fi
+
+  if [ "$agent" = "all" ]; then
+    header "Restarting all agents"
+    pm2 restart all 2>/dev/null
+    pm2 save --force 2>/dev/null
+    success "All agents restarted."
+    return 0
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  info "Restarting $agent..."
+  pm2 restart "$agent" 2>/dev/null || warn "$agent not found in PM2. Use 'hive start $agent' first."
+  pm2 save --force 2>/dev/null
+  success "$agent: Restarted."
+}
+
+cmd_logs() {
+  local agent lines
+  agent=$(normalize_agent "$1")
+  lines="${2:-30}"
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive logs <agent> [lines]"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  pm2 logs "$agent" --lines "$lines" --nostream 2>/dev/null || error "Could not fetch logs for $agent."
+}
+
+cmd_newsession() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive newsession <agent>"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  local bdir session_file
+  bdir=$(agent_behavior_dir "$agent")
+  session_file="$bdir/session.json"
+
+  if [ -f "$session_file" ]; then
+    echo '{"sessionId":"","updatedAt":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$session_file"
+    success "$agent: Session cleared. Next Discord message starts a fresh conversation."
+  else
+    warn "$agent: No session file found (agent may not have been messaged yet)."
+  fi
+}
+
+cmd_session() {
+  local agent
+  agent=$(normalize_agent "$@")
+
+  if [ -z "$agent" ]; then
+    error "Usage: hive session <agent>"
+    return 1
+  fi
+
+  if ! agent_exists "$agent"; then
+    error "Agent '$agent' not found. Run 'hive list' to see available agents."
+    return 1
+  fi
+
+  local bdir session_file
+  bdir=$(agent_behavior_dir "$agent")
+  session_file="$bdir/session.json"
+
+  if [ -f "$session_file" ]; then
+    echo -e "${BOLD}Session for $agent:${RESET}"
+    python3 -c "
+import json
+with open('$session_file') as f:
+    d = json.load(f)
+sid = d.get('sessionId', '')
+updated = d.get('updatedAt', 'unknown')
+if sid:
+    print(f'  Session ID: {sid}')
+    print(f'  Updated: {updated}')
+else:
+    print('  No active session.')
+" 2>/dev/null || cat "$session_file"
+  else
+    echo "  No session file found."
+  fi
+}
+
+cmd_build() {
+  header "Building Hive"
+  info "Compiling TypeScript..."
+  (cd "$HIVE_ROOT" && npm run build)
+  success "Build complete."
+}
+
+# v1.5.0 C.1 — fetch + verify + staging helpers for the new tarball-based update flow.
+# These functions are consumed by C.2 (atomic-overlay swap), C.3 (rollback),
+# C.4 (doctor sweep), C.5 (--check --json), C.6 (state-file emission), C.7 (migration).
+# The user-facing `hive update` command keeps v1.4.9 git-pull behavior until the
+# cut-over leaf flips it to use this pipeline.
+#
+# Spec: docs/v1.5.0-tasks/C.1-update-fetch-verify-staging.md
+_update_default_api_url() {
+  echo "${HIVE_RELEASES_API:-https://neato-hive-site.vercel.app/releases/current.json}"
+}
+
+_update_local_version() {
+  local pkg="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}/package.json"
+  if [ ! -f "${pkg}" ]; then
+    echo "ERROR: ${pkg} not found" >&2
+    return 1
+  fi
+  node -e "console.log(require('${pkg}').version)"
+}
+
+# v1.5.0 C.6 — SSE state-file producer for hive update progress.
+# Appends JSONL events to ~/.neato-hive/state/update-<id>.jsonl at every
+# phase boundary. D.3 SSE relay tail-follows + /api/update/status/:id
+# polling fallback reads same file. E.5 frontend renders progress.
+# Locked event schema: {phase, ts, sequence, detail} per line.
+# Locked phase vocabulary: see docs/v1.5.0-tasks/C.6-sse-state-file.md §Goal.
+# When HIVE_UPDATE_STATE_FILE env is unset, helper is a no-op (preserves
+# backward compat for direct helper invocation in unit tests).
+_update_emit_progress() {
+  local phase="$1"  # _update_emit_progress
+  local detail_json="${2:-}"  # _update_emit_progress
+  [ -n "${detail_json}" ] || detail_json='{}'  # _update_emit_progress
+  local state_file="${HIVE_UPDATE_STATE_FILE:-}"  # _update_emit_progress
+  [ -z "${state_file}" ] && return 0  # _update_emit_progress
+  mkdir -p "$(dirname "${state_file}")" 2>/dev/null || true  # _update_emit_progress
+  local seq=0  # _update_emit_progress
+  [ -f "${state_file}" ] && seq=$(wc -l < "${state_file}" | tr -d ' ')  # _update_emit_progress
+  local ts  # _update_emit_progress
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")  # _update_emit_progress
+  local event  # _update_emit_progress
+  event=$(jq -n -c --arg phase "${phase}" --arg ts "${ts}" --argjson sequence "${seq}" --argjson detail "${detail_json}" '{phase: $phase, ts: $ts, sequence: $sequence, detail: $detail}' 2>/dev/null) || event=$(jq -n -c --arg phase "${phase}" --arg ts "${ts}" --argjson sequence "${seq}" --arg raw "${detail_json}" '{phase: $phase, ts: $ts, sequence: $sequence, detail: {error: "malformed_detail_json", raw: $raw}}')  # _update_emit_progress
+  echo "${event}" >> "${state_file}"  # _update_emit_progress
+  return 0  # _update_emit_progress
+} # _update_emit_progress
+_update_fetch_current_metadata() {
+  local out="$1"
+  local url
+  url="$(_update_default_api_url)"
+  _update_emit_progress "fetch-start" "$(jq -cn --arg api_url "${url}" '{api_url: $api_url}')"  # _update_emit_progress
+  if ! curl -fsSL "${url}" -o "${out}"; then
+    _update_emit_progress "error" "$(jq -cn --arg step "fetch-current-metadata" --arg error "failed to fetch ${url}" '{step: $step, error: $error}')"  # _update_emit_progress
+    echo "ERROR: failed to fetch ${url}" >&2
+    return 1
+  fi
+
+  if ! jq -e '
+    .version != null and
+    .tarball_url != null and
+    .checksum_sha256 != null and
+    .released_at != null and
+    .changelog_url != null
+  ' "${out}" >/dev/null 2>&1; then
+    _update_emit_progress "error" "$(jq -cn --arg step "fetch-current-metadata" --arg error "${url} returned malformed JSON" '{step: $step, error: $error}')"  # _update_emit_progress
+    echo "ERROR: ${url} returned malformed JSON (missing required fields)" >&2
+    cat "${out}" >&2
+    return 1
+  fi
+
+  _update_emit_progress "fetch-complete" "$(jq -cn --arg remote_version "$(jq -r '.version' "${out}" 2>/dev/null)" '{remote_version: $remote_version}')"  # _update_emit_progress
+  return 0
+}
+
+_update_compare_versions() {
+  # Returns 0 if local >= remote (no update needed).
+  # Returns 1 if local < remote (update available).
+  # v1.5.18 — was previously `local != remote → update`, which suggested
+  # downgrades when local was ahead (e.g. during a release ceremony where
+  # local is bumped before Vercel auto-deploys current.json).
+  local local_v="$1"
+  local remote_v="$2"
+
+  # Equal short-circuit (handles identical strings + identical pre-releases)
+  if [ "${local_v}" = "${remote_v}" ]; then
+    return 0
+  fi
+
+  # Strip pre-release suffix for major.minor.patch comparison
+  local lv="${local_v%%-*}"
+  local rv="${remote_v%%-*}"
+
+  # Parse major.minor.patch (default missing components to 0)
+  local lvM lvm lvp rvM rvm rvp
+  IFS=. read -r lvM lvm lvp <<< "${lv}"
+  IFS=. read -r rvM rvm rvp <<< "${rv}"
+  lvM="${lvM:-0}"; lvm="${lvm:-0}"; lvp="${lvp:-0}"
+  rvM="${rvM:-0}"; rvm="${rvm:-0}"; rvp="${rvp:-0}"
+
+  # Compare major, then minor, then patch
+  if [ "${lvM}" -gt "${rvM}" ]; then return 0; fi
+  if [ "${lvM}" -lt "${rvM}" ]; then return 1; fi
+  if [ "${lvm}" -gt "${rvm}" ]; then return 0; fi
+  if [ "${lvm}" -lt "${rvm}" ]; then return 1; fi
+  if [ "${lvp}" -ge "${rvp}" ]; then return 0; fi
+  return 1
+}
+
+# v1.5.0 C.5 — hive update --check [--json] read-only mode.
+# Calls C.1 _update_fetch_current_metadata, compares to local version, emits human-readable
+# or JSON output. Used by dashboard /api/update/check (Phase E.5) + CLI scripting.
+# Non-mutating: no download, no extract, no overlay, no lock. Safe to run concurrently.
+# Spec: docs/v1.5.0-tasks/C.5-update-check-json.md
+_update_check() {
+  local emit_json=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json)
+        emit_json=1
+        shift
+        ;;
+      *)
+        echo "ERROR: unknown arg '$1'" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  local local_version
+  local_version=$(_update_local_version 2>/dev/null) || local_version=""
+
+  local tmp_metadata
+  tmp_metadata=$(mktemp -t hive-update-check.XXXXXX) || {
+    echo "ERROR: failed to create temp file" >&2
+    return 1
+  }
+  HIVE_UPDATE_CHECK_TMP_METADATA="${tmp_metadata}"
+  trap 'rm -f "${HIVE_UPDATE_CHECK_TMP_METADATA}"' EXIT
+
+  if ! _update_fetch_current_metadata "${tmp_metadata}" 2>/dev/null; then
+    local api_url
+    api_url="$(_update_default_api_url)"
+    if [ "${emit_json}" -eq 1 ]; then
+      jq -cn \
+        --arg local "${local_version}" \
+        --arg url "${api_url}" \
+        '{update_available: null, error: ("failed to fetch metadata from " + $url), local_version: (if $local == "" then null else $local end)}'
+    else
+      echo "ERROR: failed to fetch metadata from ${api_url}" >&2
+      if [ -n "${local_version}" ]; then
+        echo "Local: v${local_version}"
+      fi
+    fi
+    return 1
+  fi
+
+  local remote_version remote_url remote_sha remote_released_at remote_changelog_url
+  remote_version=$(jq -r '.version' "${tmp_metadata}")
+  remote_url=$(jq -r '.tarball_url' "${tmp_metadata}")
+  remote_sha=$(jq -r '.checksum_sha256' "${tmp_metadata}")
+  remote_released_at=$(jq -r '.released_at' "${tmp_metadata}")
+  remote_changelog_url=$(jq -r '.changelog_url' "${tmp_metadata}")
+
+  local update_available="false"
+  if [ -z "${local_version}" ] || ! _update_compare_versions "${local_version}" "${remote_version}"; then
+    update_available="true"
+  fi
+
+  if [ "${emit_json}" -eq 1 ]; then
+    if [ "${update_available}" = "true" ]; then
+      jq -cn \
+        --arg local "${local_version}" \
+        --arg remote "${remote_version}" \
+        --arg url "${remote_url}" \
+        --arg sha "${remote_sha}" \
+        --arg released "${remote_released_at}" \
+        --arg changelog "${remote_changelog_url}" \
+        '{update_available: true, local_version: (if $local == "" then null else $local end), remote_version: $remote, tarball_url: $url, checksum_sha256: $sha, released_at: $released, changelog_url: $changelog}'
+    else
+      jq -cn \
+        --arg local "${local_version}" \
+        --arg remote "${remote_version}" \
+        --arg released "${remote_released_at}" \
+        '{update_available: false, local_version: $local, remote_version: $remote, released_at: $released}'
+    fi
+  else
+    if [ "${update_available}" = "true" ]; then
+      if [ -n "${local_version}" ]; then
+        echo "Update available: v${local_version} → v${remote_version}"
+      else
+        echo "Update available: → v${remote_version} (no local version detected)"
+      fi
+      echo "  Tarball:   ${remote_url}"
+      echo "  Checksum:  ${remote_sha}"
+      echo "  Released:  ${remote_released_at}"
+      echo "  Changelog: ${remote_changelog_url}"
+    else
+      echo "Already at v${local_version} (released ${remote_released_at}). No update needed."
+    fi
+  fi
+
+  return 0
+}
+
+_update_acquire_lock() {
+  local lockfile="${HIVE_LOCK_FILE:-$HOME/.neato-hive/.update.lock}"
+  local holder_pid=""
+  mkdir -p "$(dirname "${lockfile}")"
+  holder_pid=$(lsof -t "${lockfile}" 2>/dev/null | awk -v self="$$" '$1 != self { print; exit }')
+  if [ -n "${holder_pid}" ]; then
+    echo "ERROR: another hive update invocation holds ${lockfile}" >&2
+    echo "       (lock holder PID: ${holder_pid})" >&2
+    return 1
+  fi
+  exec 9>"${lockfile}"
+  if ! flock -xn 9; then
+    echo "ERROR: another hive update invocation holds ${lockfile}" >&2
+    echo "       (lock holder PID: $(lsof -t "${lockfile}" 2>/dev/null | head -1 || echo unknown))" >&2
+    return 1
+  fi
+  return 0
+}
+
+_update_diskspace_check() {
+  local expected_bytes="$1"
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local required=$((expected_bytes * 3))
+  local available_kb
+  available_kb=$(df -k "${install_root}" | awk 'NR==2 {print $4}')
+  local available_bytes=$((available_kb * 1024))
+  if [ "${available_bytes}" -lt "${required}" ]; then
+    echo "ERROR: insufficient disk space" >&2
+    echo "  Required (3× tarball): $((required / 1024 / 1024)) MiB" >&2
+    echo "  Available:             $((available_bytes / 1024 / 1024)) MiB" >&2
+    echo "  Free up space and retry." >&2
+    return 1
+  fi
+  return 0
+}
+
+_update_stage_setup() {
+  local staging_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}/.update-staging"
+  local id
+  id="$(date -u +%Y%m%dT%H%M%SZ)-$$-$(uuidgen 2>/dev/null | head -c8 | tr -d '-' || echo "${RANDOM}${RANDOM}")"
+  local staging_dir="${staging_root}/${id}"
+  if ! mkdir -p "${staging_dir}"; then
+    echo "ERROR: failed to create staging dir ${staging_dir}" >&2
+    return 1
+  fi
+  echo "${staging_dir}"
+  return 0
+}
+
+_update_stage_cleanup() {
+  local staging_dir="$1"
+  local staging_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}/.update-staging"
+  case "${staging_dir}" in
+    "${staging_root}/"*)
+      rm -rf "${staging_dir}"
+      ;;
+    *)
+      echo "ERROR: refusing to remove ${staging_dir} (not under ${staging_root})" >&2
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+_update_download_tarball() {
+  local url="$1"
+  local out="$2"
+  _update_emit_progress "download-start" "$(jq -cn --arg tarball_url "${url}" '{tarball_url: $tarball_url}')"  # _update_emit_progress
+  if ! curl -fsSL "${url}" -o "${out}"; then
+    _update_emit_progress "error" "$(jq -cn --arg step "download-tarball" --arg error "failed to download ${url}" '{step: $step, error: $error}')"  # _update_emit_progress
+    echo "ERROR: failed to download ${url}" >&2
+    return 1
+  fi
+  _update_emit_progress "download-complete" "$(jq -cn --arg tarball_path "${out}" --argjson size_bytes "$(wc -c < "${out}" | tr -d ' ')" '{tarball_path: $tarball_path, size_bytes: $size_bytes}')"  # _update_emit_progress
+  return 0
+}
+
+_update_verify_checksum() {
+  local tarball="$1"
+  local expected="$2"
+  local actual
+  actual=$(shasum -a 256 "${tarball}" | awk '{print $1}')
+  if [ "${actual}" != "${expected}" ]; then
+    _update_emit_progress "error" "$(jq -cn --arg step "verify-checksum" --arg error "checksum mismatch" '{step: $step, error: $error}')"  # _update_emit_progress
+    echo "ERROR: checksum mismatch" >&2
+    echo "  Expected: ${expected}" >&2
+    echo "  Actual:   ${actual}" >&2
+    echo "  Aborting (potential tampering or corrupt download)." >&2
+    return 1
+  fi
+  _update_emit_progress "verify-complete" "$(jq -cn --arg sha256 "${actual}" '{sha256: $sha256}')"  # _update_emit_progress
+  return 0
+}
+
+_update_dry_run_enabled() {
+  [ "${HIVE_DRY_RUN:-0}" = "1" ]
+}
+
+# v1.5.0 C.2 — atomic-overlay swap helpers.
+# - _update_extract_tarball: extracts tarball into staging
+# - _update_apply_overlay: REPLACE_LIST per-item rename to .old.<ts>, new content in place
+# - _update_revert_overlay: walks applied.list manifest in reverse, restores from shadow
+# Manifest at staging_dir/applied.list survives crashes for post-mortem recovery.
+# .old.<ts> cleanup is C.4's job (doctor success path).
+# Spec: docs/v1.5.0-tasks/C.2-atomic-overlay-swap.md
+_update_write_manifest() {
+  local manifest="$1"
+  local item="$2"
+  if [ -z "${manifest}" ] || [ -z "${item}" ]; then
+    echo "ERROR: _update_write_manifest requires <manifest> <item>" >&2
+    return 1
+  fi
+  printf '%s\n' "${item}" >> "${manifest}"
+}
+
+_update_read_manifest() {
+  local manifest="$1"
+  if [ -z "${manifest}" ]; then
+    echo "ERROR: _update_read_manifest requires <manifest>" >&2
+    return 1
+  fi
+  if [ ! -f "${manifest}" ]; then
+    echo "ERROR: manifest not found: ${manifest}" >&2
+    return 1
+  fi
+  awk 'NF { print }' "${manifest}"
+}
+
+_update_extract_tarball() {
+  local tarball="$1"
+  local staging_dir="$2"
+
+  if [ ! -f "${tarball}" ]; then
+    echo "ERROR: tarball not found: ${tarball}" >&2
+    return 1
+  fi
+  if [ ! -d "${staging_dir}" ]; then
+    echo "ERROR: staging dir not found: ${staging_dir}" >&2
+    return 1
+  fi
+
+  echo "==> Extracting ${tarball} into ${staging_dir}/..."
+  if ! tar -xzf "${tarball}" -C "${staging_dir}"; then
+    _update_emit_progress "error" "$(jq -cn --arg step "extract-tarball" --arg error "tar extraction failed" '{step: $step, error: $error}')"  # _update_emit_progress
+    echo "ERROR: tar extraction failed" >&2
+    return 1
+  fi
+
+  if [ ! -d "${staging_dir}/dist-pkg" ]; then
+    _update_emit_progress "error" "$(jq -cn --arg step "extract-tarball" --arg error "dist-pkg directory missing after extraction" '{step: $step, error: $error}')"  # _update_emit_progress
+    echo "ERROR: extracted tarball does not contain expected dist-pkg/ directory" >&2
+    echo "       contents:" >&2
+    find "${staging_dir}" -mindepth 1 -maxdepth 1 -exec basename {} \; >&2
+    return 1
+  fi
+
+  echo "==> Extracted contents:"
+  find "${staging_dir}/dist-pkg" -mindepth 1 -maxdepth 1 -exec basename {} \; | head -20
+  _update_emit_progress "extract-complete" "$(jq -cn --arg extracted_path "${staging_dir}/dist-pkg" '{extracted_path: $extracted_path}')"  # _update_emit_progress
+  return 0
+}
+
+_update_revert_overlay() {
+  local ts="$1"
+  local manifest_path="${2:-}"
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local found=""
+
+  if [ -z "${ts}" ]; then
+    echo "ERROR: _update_revert_overlay requires <ts> arg" >&2
+    return 1
+  fi
+
+  if [ -z "${manifest_path}" ]; then
+    found=$(find "${install_root}/.update-staging" -name 'applied.list' 2>/dev/null | head -1)
+    if [ -z "${found}" ]; then
+      echo "ERROR: no manifest found and no path provided" >&2
+      return 1
+    fi
+    manifest_path="${found}"
+    echo "==> Inferred manifest: ${manifest_path}"
+  fi
+
+  if [ ! -f "${manifest_path}" ]; then
+    echo "ERROR: manifest not found: ${manifest_path}" >&2
+    return 1
+  fi
+
+  echo "==> Reverting overlay (ts=${ts}) from ${manifest_path}..."
+  _update_emit_progress "rollback-start" "$(jq -cn --arg ts "${ts}" '{ts: $ts}')"  # _update_emit_progress
+
+  local -a items=()
+  local line=""
+  while IFS= read -r line; do
+    items+=("${line}")
+  done < <(_update_read_manifest "${manifest_path}")
+
+  local failures=0
+  local i=${#items[@]}
+  while [ "${i}" -gt 0 ]; do
+    i=$((i - 1))
+    local item="${items[$i]}"
+    local current="${install_root}/${item}"
+    local shadow="${install_root}/.${item}.old.${ts}"
+
+    if [ -e "${current}" ]; then
+      if ! rm -rf "${current}"; then
+        echo "ERROR: failed to rm ${current} (continuing)" >&2
+        failures=$((failures + 1))
+        continue
+      fi
+    fi
+
+    if [ -e "${shadow}" ]; then
+      if ! mv "${shadow}" "${current}"; then
+        echo "ERROR: failed to restore ${shadow} → ${current} (continuing)" >&2
+        failures=$((failures + 1))
+        continue
+      fi
+      echo "    ↩ ${item}"
+    else
+      echo "    - ${item} (no shadow — was a fresh add, removed)"
+    fi
+  done
+
+  if [ "${failures}" -gt 0 ]; then
+    echo "==> Revert completed with ${failures} failure(s). Manual recovery may be needed." >&2
+    return 1
+  fi
+
+  echo "==> Revert clean."
+  _update_emit_progress "rollback-complete" "$(jq -cn --argjson items_reverted "$((${#items[@]} - failures))" '{items_reverted: $items_reverted}')"  # _update_emit_progress
+  return 0
+}
+
+_update_apply_overlay() {
+  local staging_dir="$1"
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local extracted="${staging_dir}/dist-pkg"
+
+  if [ ! -d "${extracted}" ]; then
+    echo "ERROR: ${extracted}/ not found (run _update_extract_tarball first)" >&2
+    return 1
+  fi
+
+  # v1.5.24 — added "scripts" to fix a long-standing overlay miss.
+  # scripts/ contains framework helpers (tailscale-expose.sh, install-prereqs.sh,
+  # smoke-test-bash3.sh, release-*.sh) that ship in every release tarball at
+  # dist-pkg/scripts/ but were silently skipped by the overlay. Pre-v1.5.16
+  # installs never received scripts/tailscale-expose.sh; pre-v1.5.13 installs
+  # were missing newer release scripts. Adding "scripts" to REPLACE_LIST means
+  # framework-managed scripts overlay on update going forward.
+  local -a REPLACE_LIST=(
+    "dist" "bin" "templates" "shared" "skills" "dashboard" "config" "scripts"
+    "package.json" "pnpm-lock.yaml" "VERSION"
+    "setup.sh" "ecosystem.config.cjs" ".env.example"
+  )
+
+  local ts=""
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local manifest="${staging_dir}/applied.list"
+  : > "${manifest}"
+
+  echo "==> Applying overlay swap (ts=${ts})..."
+  local item=""
+  local src=""
+  local dst=""
+  local shadow=""
+  for item in "${REPLACE_LIST[@]}"; do
+    src="${extracted}/${item}"
+    dst="${install_root}/${item}"
+    shadow="${install_root}/.${item}.old.${ts}"
+
+    if [ ! -e "${src}" ]; then
+      echo "    - ${item} (not in tarball — skipped)"
+      continue
+    fi
+
+    # v1.5.12 — user-state merge before whole-directory swap.
+    # When both src and dst are directories, copy any file that exists in
+    # dst but NOT in src into the staging area before the swap. This
+    # preserves gitignored user-state files (config/agents.local.yaml,
+    # config/users.local.yaml, config/config.yaml.backup-*, shared/exchange/*,
+    # any other user-added files in framework dirs) across the overlay.
+    #
+    # Without this, the wholesale `mv dst shadow; mv src dst` pattern moves
+    # the user's gitignored files into the shadow directory, breaking the
+    # invariant that hive update preserves user state. PRESERVE_LIST verify
+    # catches it as drift and reverts the whole update — coworker installs
+    # got stuck at "PRESERVE_LIST drift detected" with no path forward.
+    if [ -d "${src}" ] && [ -d "${dst}" ]; then
+      local rel="" preserved_count=0
+      while IFS= read -r f; do
+        [ -z "${f}" ] && continue
+        rel="${f#${dst}/}"
+        if [ ! -e "${src}/${rel}" ]; then
+          mkdir -p "${src}/$(dirname "${rel}")"
+          cp -a "${f}" "${src}/${rel}"
+          preserved_count=$((preserved_count + 1))
+        fi
+      done < <(find "${dst}" -type f 2>/dev/null)
+      if [ "${preserved_count}" -gt 0 ]; then
+        echo "    ↪ ${item}/ — merged ${preserved_count} user-state file(s) forward"
+      fi
+    fi
+
+    if [ -e "${dst}" ]; then
+      if ! mv "${dst}" "${shadow}"; then
+        echo "ERROR: failed to rename ${dst} → ${shadow}" >&2
+        echo "       reverting prior swaps..." >&2
+        _update_revert_overlay "${ts}" "${manifest}"
+        return 1
+      fi
+    fi
+
+    if ! mv "${src}" "${dst}"; then
+      echo "ERROR: failed to move ${src} → ${dst}" >&2
+      if [ -e "${shadow}" ]; then
+        mv "${shadow}" "${dst}" 2>/dev/null || true
+      fi
+      echo "       reverting prior swaps..." >&2
+      _update_revert_overlay "${ts}" "${manifest}"
+      return 1
+    fi
+
+    if ! _update_write_manifest "${manifest}" "${item}"; then
+      echo "ERROR: failed to append ${item} to ${manifest}" >&2
+      if [ -e "${dst}" ]; then
+        rm -rf "${dst}" 2>/dev/null || true
+      fi
+      if [ -e "${shadow}" ]; then
+        mv "${shadow}" "${dst}" 2>/dev/null || true
+      fi
+      echo "       reverting prior swaps..." >&2
+      _update_revert_overlay "${ts}" "${manifest}"
+      return 1
+    fi
+
+    echo "    ✓ ${item}"
+  done
+
+  echo "==> Overlay applied. Manifest: ${manifest}"
+  echo "==> Timestamp: ${ts}"
+  echo "==> Shadow files (recoverable): ${install_root}/.<item>.old.${ts}"
+  _update_emit_progress "overlay-applied" "$(jq -cn --arg ts "${ts}" --argjson items_swapped "$(wc -l < "${manifest}" | tr -d ' ')" '{ts: $ts, items_swapped: $items_swapped}')"  # _update_emit_progress
+  echo "${ts}"
+  return 0
+}
+
+# v1.5.0 C.3 — full-flow orchestrator + rollback path.
+# - _update_run_full_flow_with_revert: composes C.1 fetch+verify+stage + C.2 extract+apply
+#   with auto-revert on mid-flow failure. Hidden via _update-full-flow subcommand for testing.
+# - _update_find_latest_shadow_ts: locates the most recent .old.<ts> + corresponding manifest
+# - _update_run_rollback: user-facing rollback orchestrator. Wired via cmd_update --rollback.
+# Cut-over of cmd_update from v1.4.9 git-pull to the new pipeline is C.7's job.
+# Spec: docs/v1.5.0-tasks/C.3-lockfile-rollback.md
+
+# v1.5.0 C.4 — doctor sweep + cleanup + PRESERVE_LIST verification.
+# - _update_pnpm_install_post_extract: pnpm install --frozen-lockfile (Q2)
+# - _update_preserve_list_hash_capture / _verify: byte-identical guarantee (HARD GATE)
+# - _update_reconcile_pm2_agent_args: re-register legacy positional-arg agents with canonical --agent flags
+# - _update_pm2_restart_all: restart daemons before finalize-time doctor visibility checks
+# - _update_doctor_sweep: cmd_doctor --fix --yes wrapper (HIVE_UPDATE_SKIP_DOCTOR=1 to skip in sandbox)
+# - _update_cleanup_shadows: rm .<item>.old.<ts> on doctor success
+# - _update_cleanup_staging_residue: rm orphan .update-staging/<id>/ from aborted runs
+# - _update_post_overlay_finalize: orchestrator — install → preserve verify → doctor → cleanup OR revert
+# Spec: docs/v1.5.0-tasks/C.4-doctor-sweep-cleanup.md
+RESTART_STATUS="skipped"
+
+_update_pnpm_install_post_extract() {
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+
+  if [ ! -f "${install_root}/package.json" ] || [ ! -f "${install_root}/pnpm-lock.yaml" ]; then
+    echo "ERROR: package.json or pnpm-lock.yaml missing in ${install_root}" >&2
+    return 1
+  fi
+
+  echo "==> Running pnpm install --frozen-lockfile in ${install_root}..."
+  if ! (cd "${install_root}" && pnpm install --frozen-lockfile 2>&1 | tail -10); then
+    echo "ERROR: pnpm install --frozen-lockfile failed" >&2
+    return 1
+  fi
+  return 0
+}
+
+_update_preserve_list_hash_capture() {
+  local out="$1"
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local hive_state="${HIVE_STATE_ROOT:-$HOME/.neato-hive}"
+  local tmp="${out}.tmp"
+
+  if [ -z "${out}" ]; then
+    echo "ERROR: _update_preserve_list_hash_capture requires <output_manifest>" >&2
+    return 1
+  fi
+
+  : > "${tmp}"
+
+  # v1.5.14 — config/ removed from blanket `find` sources. The overlay legitimately
+  # REPLACES framework-tracked files in config/ (config.yaml, *.example.yaml). Previous
+  # baseline captured those files, the overlay updated them, verify saw new hashes,
+  # drift detected, revert. Now: agents/ + ~/.neato-hive/skills/ remain find-walked
+  # (user-state dirs); config/ is handled exclusively via the explicit allowlist
+  # below (only the gitignored user-state files matter).
+  #
+  # v1.5.18 — data/ removed from drift detection. data/ contains runtime state
+  # (runner-events.log, agent-watcher.log) that daemons write to continuously.
+  # The overlay never writes to data/. Including data/ in the hash baseline caused
+  # false-positive drift detection whenever hive-runner wrote a log line between
+  # baseline-capture and verify-capture (i.e. essentially always). Live daemons
+  # mutating their own runtime state is not "overlay touched protected files."
+  local -a sources=()
+  [ -d "${install_root}/agents" ] && sources+=("${install_root}/agents")
+  [ -d "${hive_state}/skills" ] && sources+=("${hive_state}/skills")
+
+  if [ "${#sources[@]}" -gt 0 ]; then
+    local f=""
+    while IFS= read -r f; do
+      [ -z "${f}" ] && continue
+      local sha=""
+      sha=$(shasum -a 256 "${f}" | awk '{print $1}')
+      printf '%s\t%s\n' "${sha}" "${f}" >> "${tmp}"
+    done < <(find "${sources[@]}" -type f 2>/dev/null | sort)
+  fi
+
+  # Explicit user-state allowlist — must survive the overlay byte-identical.
+  # Includes .env files and the gitignored config/ overlay files (replacing the
+  # blanket config/ walk above). Framework files in config/ (config.yaml,
+  # *.example.yaml) are intentionally NOT here — the overlay updates them.
+  local f=""
+  for f in \
+    "${install_root}/.env" \
+    "${install_root}/.env.local" \
+    "${install_root}/config/agents.local.yaml" \
+    "${install_root}/config/users.local.yaml"
+  do
+    if [ -f "${f}" ]; then
+      local sha=""
+      sha=$(shasum -a 256 "${f}" | awk '{print $1}')
+      printf '%s\t%s\n' "${sha}" "${f}" >> "${tmp}"
+    fi
+  done
+
+  # User-managed backup files in config/ — gitignored, may be present, must be
+  # preserved if so. Glob expansion needed because the timestamp suffix varies.
+  for f in "${install_root}"/config/config.yaml.backup-*; do
+    if [ -f "${f}" ]; then
+      local sha=""
+      sha=$(shasum -a 256 "${f}" | awk '{print $1}')
+      printf '%s\t%s\n' "${sha}" "${f}" >> "${tmp}"
+    fi
+  done
+
+  sort -o "${out}" "${tmp}"
+  rm -f "${tmp}"
+  return 0
+}
+
+_update_preserve_list_hash_verify() {
+  local baseline="$1"
+  if [ ! -f "${baseline}" ]; then
+    echo "ERROR: baseline manifest not found: ${baseline}" >&2
+    return 1
+  fi
+
+  local verify_file="${baseline%.baseline}.verify"
+  _update_preserve_list_hash_capture "${verify_file}"
+
+  if ! diff -q "${baseline}" "${verify_file}" >/dev/null 2>&1; then
+    echo "ERROR: PRESERVE_LIST drift detected — overlay touched protected files" >&2
+    echo "       baseline: ${baseline}" >&2
+    echo "       verify:   ${verify_file}" >&2
+    diff "${baseline}" "${verify_file}" | head -20 >&2
+    return 1
+  fi
+  return 0
+}
+
+# v1.5.20 — finalize-time PM2 restart is ordered before doctor because the
+# doctor sweep includes framework-version-drift, which compares package.json
+# mtime against PM2 process uptimes. Running doctor before a full restart makes
+# that WARN tautological on every successful update. Restart hiccups are logged
+# but do not fail the update; the user can recover with a manual PM2 restart.
+#
+# v1.5.21 — reconcile legacy PM2 agent registrations before the full restart.
+# Forensic contract: if we detect stale positional-arg registrations, write the
+# raw `pm2 jlist` payload to HIVE_STATE_ROOT (default ~/.neato-hive) before any
+# PM2 mutation, then prune older pm2-migration-*.json snapshots down to the 5
+# most recent. If re-registration fails mid-stream, the caller must stop before
+# `pm2 save` so `pm2 resurrect` can recover the pre-migration dump.pm2 state.
+PM2_RECONCILE_AUDIT_PATH=""
+PM2_RECONCILE_AUDIT_TS=""
+
+_update_reconcile_pm2_agent_args() {
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local state_root="${HIVE_STATE_ROOT:-$HOME/.neato-hive}"
+  local pm2_json=""
+  local stale_agents_file=""
+  local stale_count=0
+  local migrated_count=0
+  local utc_ts=""
+  local audit_path=""
+  local row=""
+  local agent=""
+  local exec_path=""
+  local args_json=""
+  local is_canonical=""
+  local is_legacy=""
+
+  PM2_RECONCILE_AUDIT_PATH=""
+  PM2_RECONCILE_AUDIT_TS=""
+
+  if ! command -v pm2 >/dev/null 2>&1; then
+    echo "==> [reconcile-pm2-args] SKIPPED (pm2 not available)"
+    return 0
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "==> [reconcile-pm2-args] WARNING: jq not available — skipping"
+    return 0
+  fi
+
+  if ! pm2_json="$(pm2 jlist 2>/dev/null)"; then
+    echo "==> [reconcile-pm2-args] WARNING: pm2 jlist failed — skipping"
+    return 0
+  fi
+
+  stale_agents_file="$(mktemp "/tmp/hive-pm2-reconcile.XXXXXX")"
+
+  while IFS= read -r row; do
+    [ -n "${row}" ] || continue
+    agent="$(printf '%s\n' "${row}" | jq -r '.name // ""')"
+    exec_path="$(printf '%s\n' "${row}" | jq -r '.pm2_env.pm_exec_path // ""')"
+    args_json="$(printf '%s\n' "${row}" | jq -c '.pm2_env.args // []')"
+
+    if ! printf '%s\n' "${exec_path}" | grep -Eq 'dist/index\.js$'; then
+      continue
+    fi
+
+    is_canonical="$(printf '%s\n' "${row}" | jq -r --arg agent "${agent}" '
+      (.pm2_env.args // []) as $args
+      | if ($args | type) != "array" then "false"
+        else ([range(0; ($args | length)) | select($args[.] == "--agent" and (($args[.+1] // "") == $agent))] | length > 0 | tostring)
+        end
+    ')"
+    if [ "${is_canonical}" = "true" ]; then
+      continue
+    fi
+
+    is_legacy="$(printf '%s\n' "${row}" | jq -r --arg agent "${agent}" '
+      (.pm2_env.args // []) as $args
+      | (($args | type) == "array" and ($args | length) == 1 and $args[0] == $agent) | tostring
+    ')"
+
+    if [ "${is_legacy}" = "true" ]; then
+      printf '%s\n' "${agent}" >> "${stale_agents_file}"
+      stale_count=$((stale_count + 1))
+      continue
+    fi
+
+    echo "==> [reconcile-pm2-args] WARN: leaving ${agent} unchanged (unrecognized argv: ${args_json})"
+  done < <(printf '%s\n' "${pm2_json}" | jq -c '.[]?')
+
+  if [ "${stale_count}" -eq 0 ]; then
+    rm -f "${stale_agents_file}"
+    echo "==> [reconcile-pm2-args] all agent registrations are canonical (no migration needed)"
+    return 0
+  fi
+
+  utc_ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  audit_path="${state_root}/pm2-migration-${utc_ts}.json"
+  mkdir -p "${state_root}"
+  printf '%s\n' "${pm2_json}" > "${audit_path}"
+  ls -1t "${state_root}"/pm2-migration-*.json 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+  PM2_RECONCILE_AUDIT_PATH="${audit_path}"
+  PM2_RECONCILE_AUDIT_TS="${utc_ts}"
+
+  while IFS= read -r agent; do
+    [ -n "${agent}" ] || continue
+    echo "==> [reconcile-pm2-args] migrating ${agent} from legacy positional args to --agent flag..."
+    if pm2 delete "${agent}" >/dev/null 2>&1; then
+      echo "    delete: ok"
+    else
+      echo "    delete: WARN (pm2 delete exited $?)"
+    fi
+
+    if (cd "${install_root}" && pm2 start dist/index.js --name "${agent}" -- --agent "${agent}" >/dev/null 2>&1); then
+      echo "    register: ok"
+      migrated_count=$((migrated_count + 1))
+    else
+      echo "    register: FAILED"
+      rm -f "${stale_agents_file}"
+      return 1
+    fi
+  done < "${stale_agents_file}"
+
+  rm -f "${stale_agents_file}"
+  echo "==> [reconcile-pm2-args] migrated ${migrated_count} agent(s); pm2_save deferred to next phase"
+  return 0
+}
+
+_update_pm2_restart_all() {
+  RESTART_STATUS="skipped"
+
+  if [ "${HIVE_UPDATE_SKIP_RESTART:-0}" = "1" ]; then
+    echo ""
+    echo "==> [pm2-restart] SKIPPED (HIVE_UPDATE_SKIP_RESTART=1)"
+    echo "    NOTE: daemons are still running pre-update code."
+    echo "          Run \`pm2 restart all --update-env && pm2 save\` to recycle them."
+    return 0
+  fi
+
+  if ! command -v pm2 >/dev/null 2>&1; then
+    echo ""
+    echo "==> [pm2-restart] SKIPPED (pm2 not available)"
+    return 0
+  fi
+
+  echo ""
+  echo "==> [pm2-restart] reloading all daemons into new code..."
+  if pm2 restart all --update-env >/dev/null 2>&1 && pm2 save >/dev/null 2>&1; then
+    echo "    all daemons restarted ✓"
+    RESTART_STATUS="completed"
+  else
+    echo "    WARN: pm2 restart all failed — daemons may still be running pre-update code"
+    echo "    Run \`pm2 restart all --update-env && pm2 save\` manually to recover."
+    RESTART_STATUS="failed"
+  fi
+  return 0
+}
+
+# v1.5.20 — finalize-time doctor is visibility, not a gate. The hard integrity
+# check is _update_preserve_list_hash_verify above, which proves the overlay was
+# byte-identical across the user-state allowlist. Doctor also reports broader
+# system health (tailscale, plist, daemon crash state, version drift), and
+# those findings should inform the operator rather than trigger a full revert.
+_update_doctor_sweep() {
+  if [ "${HIVE_UPDATE_SKIP_DOCTOR:-0}" = "1" ]; then
+    echo "==> Doctor sweep SKIPPED (HIVE_UPDATE_SKIP_DOCTOR=1)"
+    return 0
+  fi
+
+  echo "==> Running cmd_doctor --fix --yes..."
+  if cmd_doctor --fix --yes 2>&1 | tail -20; then
+    echo "==> Doctor sweep clean."
+  else
+    echo "==> Doctor sweep reported issues (informational — review above)."
+    echo "    The overlay's byte-identical PRESERVE_LIST verify already passed."
+    echo "    Run \`hive doctor --fix\` after update to address remaining items."
+  fi
+  return 0
+}
+
+_update_cleanup_shadows() {
+  local ts="$1"
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  if [ -z "${ts}" ]; then
+    echo "ERROR: _update_cleanup_shadows requires <ts>" >&2
+    return 1
+  fi
+
+  local count=0
+  local shadow=""
+  while IFS= read -r shadow; do
+    [ -z "${shadow}" ] && continue
+    rm -rf "${shadow}"
+    count=$((count + 1))
+  done < <(find "${install_root}" -maxdepth 1 -name ".*.old.${ts}" 2>/dev/null)
+
+  echo "==> Removed ${count} shadow(s) matching ts=${ts}"
+  return 0
+}
+
+_update_cleanup_staging_residue() {
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local staging_root="${install_root}/.update-staging"
+
+  if [ ! -d "${staging_root}" ]; then
+    return 0
+  fi
+
+  local count=0
+  local dir=""
+  while IFS= read -r dir; do
+    [ -z "${dir}" ] && continue
+    if find "${dir}" -maxdepth 0 -mtime +7 2>/dev/null | grep -q . \
+       || [ ! -f "${dir}/applied.list" ]; then
+      rm -rf "${dir}"
+      count=$((count + 1))
+    fi
+  done < <(find "${staging_root}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+
+  if [ "${count}" -gt 0 ]; then
+    echo "==> Cleaned up ${count} staging residue dir(s)"
+  fi
+  return 0
+}
+
+# v1.5.11 — runtime prereqs that the framework requires at runtime but are
+# not part of node_modules. These are installed by setup.sh step 2 on fresh
+# installs; on legacy v1.4.x installs that did not run that step, or on
+# installs that pre-dated the addition of any of these tools, they may be
+# missing entirely after hive update. This function detects + installs.
+#
+# Returns 0 always. Failures are logged but do not break the update —
+# the framework files have already overlayed cleanly; missing prereqs
+# are a degraded-functionality concern, not a corrupt-install concern.
+_update_install_runtime_prereqs() {
+  echo "==> [prereqs] checking runtime dependencies..."
+
+  # Tool → install-package mapping. The left side is the binary name
+  # checked via command -v; the right side is the brew formula / apt
+  # package name (which can differ — e.g., flock comes from util-linux
+  # on Linux but is a standalone formula on brew).
+  local prereqs_macos="flock:flock gh:gh jq:jq tmux:tmux ffmpeg:ffmpeg pandoc:pandoc sqlite3:sqlite3"
+  local prereqs_linux="flock:util-linux gh:gh jq:jq tmux:tmux ffmpeg:ffmpeg pandoc:pandoc sqlite3:sqlite3"
+
+  local os_type
+  os_type="$(uname -s 2>/dev/null || echo unknown)"
+
+  local entries
+  case "$os_type" in
+    Darwin) entries="$prereqs_macos" ;;
+    Linux)  entries="$prereqs_linux" ;;
+    *)
+      echo "    WARNING: unknown OS '$os_type' — skipping prereq auto-install"
+      return 0
+      ;;
+  esac
+
+  local missing_bins=""
+  local missing_pkgs=""
+  for entry in $entries; do
+    local cmd="${entry%%:*}"
+    local pkg="${entry##*:}"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_bins="${missing_bins}${missing_bins:+ }${cmd}"
+      missing_pkgs="${missing_pkgs}${missing_pkgs:+ }${pkg}"
+    fi
+  done
+
+  if [ -z "$missing_bins" ]; then
+    echo "    all runtime prereqs present ✓"
+    return 0
+  fi
+
+  echo "    missing: $missing_bins"
+
+  if [ "$os_type" = "Darwin" ]; then
+    if ! command -v brew >/dev/null 2>&1; then
+      echo "    WARNING: Homebrew not installed — cannot auto-install missing prereqs."
+      echo "    Install Homebrew first:"
+      echo '      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+      echo "    Then re-run: hive update"
+      return 0
+    fi
+    echo "    installing via Homebrew..."
+    for pkg in $missing_pkgs; do
+      echo "    + brew install $pkg"
+      if brew install "$pkg" >/dev/null 2>&1; then
+        echo "      ✓ $pkg"
+      else
+        echo "      ✗ $pkg (install failed, continuing)"
+      fi
+    done
+  else
+    echo "    installing via apt-get..."
+    if ! sudo -n true 2>/dev/null; then
+      echo "    NOTE: sudo password may be required for apt-get install."
+    fi
+    sudo apt-get update -qq >/dev/null 2>&1 || true
+    for pkg in $missing_pkgs; do
+      echo "    + apt-get install $pkg"
+      if sudo apt-get install -y -qq "$pkg" >/dev/null 2>&1; then
+        echo "      ✓ $pkg"
+      else
+        echo "      ✗ $pkg (install failed, continuing)"
+      fi
+    done
+  fi
+
+  # Re-verify
+  local still_missing=""
+  for entry in $entries; do
+    local cmd="${entry%%:*}"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      still_missing="${still_missing}${still_missing:+ }${cmd}"
+    fi
+  done
+
+  if [ -n "$still_missing" ]; then
+    echo "    WARNING: still missing after install: $still_missing"
+    echo "    Install manually and re-run 'hive doctor' to verify."
+  else
+    echo "    all runtime prereqs satisfied ✓"
+  fi
+
+  return 0
+}
+
+# v1.5.13 — auto-reconcile PM2 daemons against ecosystem.config.cjs after
+# overlay. setup.sh step 9 runs `pm2 startOrReload ecosystem.config.cjs
+# --update-env` on fresh installs to wire up hive-runner + hive-dashboard;
+# hive update did not, so legacy installs that gained ecosystem.config.cjs
+# (v1.5.0 cutover) had the file present but the dashboard daemon never
+# started. Now hive update closes the parity gap.
+#
+# Returns 0 always. Failures are logged but do not break the update.
+_update_reconcile_pm2_daemons() {
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  if [ ! -f "${install_root}/ecosystem.config.cjs" ]; then
+    echo "==> [pm2-reconcile] no ecosystem.config.cjs in install root — skipping"
+    return 0
+  fi
+  if ! command -v pm2 >/dev/null 2>&1; then
+    echo "==> [pm2-reconcile] WARNING: pm2 not available — skipping daemon reconcile"
+    return 0
+  fi
+  echo "==> [pm2-reconcile] running pm2 startOrReload ecosystem.config.cjs --update-env..."
+  if pm2 startOrReload "${install_root}/ecosystem.config.cjs" --update-env >/dev/null 2>&1; then
+    pm2 save --force >/dev/null 2>&1 || true
+    echo "    ecosystem daemons reconciled ✓"
+  else
+    echo "    WARNING: pm2 startOrReload failed — daemons may not be online."
+    echo "    Recovery:  cd ${install_root} && pm2 startOrReload ecosystem.config.cjs --update-env"
+  fi
+  return 0
+}
+
+_update_post_overlay_finalize() {
+  local ts="$1"
+  local staging_dir="$2"
+  local preserve_baseline="$3"
+
+  echo "==> [post-overlay-finalize] start (ts=${ts})"
+  _update_emit_progress "finalize-start" "{}"  # _update_emit_progress
+
+  if ! _update_pnpm_install_post_extract; then
+    echo "==> finalize: pnpm install failed → reverting"
+    _update_emit_progress "finalize-failed" "$(jq -cn --arg step "pnpm-install" --arg error "pnpm install failed" '{step: $step, error: $error}')"  # _update_emit_progress
+    _update_revert_overlay "${ts}" "${staging_dir}/applied.list"
+    return 1
+  fi
+
+  # v1.5.11 — install runtime prereqs the new framework requires but the
+  # previous install may not have. flock was added between v1.4.x and v1.5.x;
+  # legacy v1.4.x installs that ran hive update missed it and broke. This
+  # step checks every binary the framework needs at runtime and installs
+  # any missing ones via brew (macOS) or apt-get (Linux). Non-fatal — a
+  # failed install logs WARN but does NOT revert the overlay, because the
+  # framework files are still useful even if one prereq is unavailable.
+  _update_install_runtime_prereqs || true
+
+  # v1.5.13 — reconcile PM2 daemons against the new ecosystem.config.cjs.
+  # Legacy installs may not have hive-dashboard in PM2 (it was added v1.5.0);
+  # without this step the new ecosystem file declares hive-dashboard but the
+  # daemon never starts. setup.sh step 9 already does this on fresh installs;
+  # hive update needs the same to close the parity gap.
+  # Non-fatal — failure logs WARN but does not revert the overlay.
+  _update_reconcile_pm2_daemons || true
+
+  if ! _update_preserve_list_hash_verify "${preserve_baseline}"; then
+    echo "==> finalize: PRESERVE_LIST drift detected → reverting"
+    _update_emit_progress "finalize-failed" "$(jq -cn --arg step "preserve-verify" --arg error "PRESERVE_LIST drift" '{step: $step, error: $error}')"  # _update_emit_progress
+    _update_revert_overlay "${ts}" "${staging_dir}/applied.list"
+    return 1
+  fi
+  echo "    PRESERVE_LIST byte-identical ✓"
+
+  if ! _update_reconcile_pm2_agent_args; then
+    echo "==> finalize: pm2 args reconciliation failed — install state UPDATED, daemon registrations partially migrated" >&2
+    echo "    Recovery options:" >&2
+    echo "      1. pm2 resurrect              # restore pre-reconcile pm2 state from dump.pm2" >&2
+    echo "      2. hive start <agent>          # manually register specific agents with canonical args" >&2
+    echo "      3. cat ${PM2_RECONCILE_AUDIT_PATH:-${HIVE_STATE_ROOT:-$HOME/.neato-hive}/pm2-migration-${PM2_RECONCILE_AUDIT_TS}.json}  # forensic snapshot of pre-migration state" >&2
+    echo "    The overlay (framework files) is fully applied. Agents need manual recovery." >&2
+    _update_emit_progress "finalize-failed" "$(jq -cn --arg step "pm2-reconcile" --arg error "agent re-registration failed" '{step: $step, error: $error}')"  # _update_emit_progress
+    return 1
+  fi
+
+  _update_pm2_restart_all
+  _update_doctor_sweep
+
+  _update_cleanup_shadows "${ts}"
+  _update_stage_cleanup "${staging_dir}"
+  _update_cleanup_staging_residue
+
+  echo "==> [post-overlay-finalize] success — install clean."
+  _update_emit_progress "finalize-complete" "{}"  # _update_emit_progress
+  return 0
+}
+
+# v1.5.0 C.7 — implicit migration handler for v1.4.x -> v1.5.0 jump.
+# First-run after the cut-over (cmd_update now invokes the C.1-C.6 pipeline)
+# performs idempotent setup: generate HIVE_DASHBOARD_TOKEN in .env if absent,
+# emit a "PM2 reload pending" banner + state-file event, and write a persistent
+# marker so subsequent updates skip migration. Marker lives under HIVE_STATE_ROOT
+# (~/.neato-hive/migrations/v1_5_0_completed) - outside the install root, so
+# overlay updates cannot touch it.
+#
+# Worker contract: this helper does NOT exec PM2. PM2 reload is owner ceremony.
+# The banner instructs the owner; the state event lets the dashboard render
+# the "reload pending" hint when the Updates page renders post-update.
+#
+# Idempotency: safe to call any number of times. Token generation is conditional
+# on .env not already containing HIVE_DASHBOARD_TOKEN=. Marker write is mkdir+touch.
+#
+# See docs/v1.5.0-tasks/C.7-migration-handler.md for the full contract.
+_update_v1_5_0_migration_marker_path() {
+  local state_root="${HIVE_STATE_ROOT:-$HOME/.neato-hive}"
+  echo "${state_root}/migrations/v1_5_0_completed"
+}
+
+_update_v1_5_0_check_first_run_needed() {
+  local marker
+  marker="$(_update_v1_5_0_migration_marker_path)"
+  [ ! -f "${marker}" ]
+}
+
+_update_v1_5_0_run_first_run_migration() {
+  local from_version="${1:-unknown}"
+  local to_version="${2:-unknown}"
+
+  _update_emit_progress "migration-start" \
+    "$(jq -cn --arg from "${from_version}" --arg to "${to_version}" \
+      '{from_version: $from, to_version: $to}')"
+
+  # --- Step 1: dashboard token ---------------------------------------------
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local env_file="${install_root}/.env"
+
+  [ ! -f "${env_file}" ] && touch "${env_file}"
+
+  if grep -qE '^HIVE_DASHBOARD_TOKEN=' "${env_file}"; then
+    _update_emit_progress "migration-token-already-present" "{}"
+    info "    Dashboard token already present in .env - skipping token generation"
+  else
+    local token
+    if ! token="$(openssl rand -hex 32 2>/dev/null)" || [ -z "${token}" ]; then
+      _update_emit_progress "migration-failed" \
+        "$(jq -cn --arg step "token-gen" --arg error "openssl rand -hex 32 failed" \
+          '{step: $step, error: $error}')"
+      error "Migration failed: openssl rand -hex 32 produced no output"
+      return 1
+    fi
+    printf '\nHIVE_DASHBOARD_TOKEN=%s\n' "${token}" >> "${env_file}"
+    _update_emit_progress "migration-token-generated" "{}"
+    info "    Generated HIVE_DASHBOARD_TOKEN in .env (256-bit hex)"
+  fi
+
+  # --- Step 2: PM2 reload pending banner -----------------------------------
+  # We do NOT exec PM2 ourselves - that is owner ceremony. Print the banner
+  # and emit a state-file event so the dashboard can render the hint.
+  local ecosystem_path="${install_root}/ecosystem.config.cjs"
+  _update_emit_progress "migration-pm2-reload-pending" \
+    "$(jq -cn --arg path "${ecosystem_path}" '{ecosystem_path: $path}')"
+
+  echo ""
+  echo "  +---------------------------------------------------------------+"
+  echo "  |  v1.5.0 migration: PM2 reload required                       |"
+  echo "  |                                                             |"
+  echo "  |  The v1.5.0 ecosystem.config.cjs adds a 'hive-dashboard'    |"
+  echo "  |  process. To start it, run:                                 |"
+  echo "  |                                                             |"
+  echo "  |      cd ${install_root}"
+  echo "  |      pm2 startOrReload ecosystem.config.cjs"
+  echo "  |      pm2 save"
+  echo "  |                                                             |"
+  echo "  |  This is a one-time step. Subsequent updates will not show  |"
+  echo "  |  this banner.                                               |"
+  echo "  +---------------------------------------------------------------+"
+  echo ""
+
+  # --- Step 3: write marker ------------------------------------------------
+  local marker
+  marker="$(_update_v1_5_0_migration_marker_path)"
+  mkdir -p "$(dirname "${marker}")" 2>/dev/null || true
+  touch "${marker}" || {
+    _update_emit_progress "migration-failed" \
+      "$(jq -cn --arg step "marker-write" --arg error "touch ${marker} failed" \
+        '{step: $step, error: $error}')"
+    error "Migration failed: could not write marker file ${marker}"
+    return 1
+  }
+
+  _update_emit_progress "migration-complete" \
+    "$(jq -cn --arg from "${from_version}" --arg to "${to_version}" --arg marker "${marker}" \
+      '{from_version: $from, to_version: $to, marker: $marker}')"
+  info "    Migration complete (marker: ${marker})"
+  return 0
+}
+
+_update_run_full_flow_with_revert() {
+  local dry_run=0
+  local inject_failure_after=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --inject-failure-after) inject_failure_after="$2"; shift 2 ;;
+      *) echo "ERROR: unknown arg '$1'" >&2; return 2 ;;
+    esac
+  done
+
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local staging_dir=""
+  local metadata=""
+  local remote_version=""
+  local remote_url=""
+  local remote_sha=""
+  local local_version=""
+  local tarball_path=""
+  local ts=""
+  local preserve_baseline=""
+  local update_id=""  # _update_emit_progress
+  local state_dir=""  # _update_emit_progress
+  local update_available="true"  # _update_emit_progress
+  local dry_run_mode=0
+
+  echo "==> [full-flow] start"
+  if [ "${dry_run}" -eq 1 ] || _update_dry_run_enabled; then
+    dry_run_mode=1
+  fi
+
+  if ! _update_acquire_lock; then
+    return 1
+  fi
+  echo "    lock acquired"
+
+  if ! staging_dir="$(_update_stage_setup)"; then
+    return 1
+  fi
+  echo "    staging: ${staging_dir}"
+  update_id="$(basename "${staging_dir}")"  # _update_emit_progress
+  state_dir="${HIVE_STATE_ROOT:-$HOME/.neato-hive}/state"  # _update_emit_progress
+  mkdir -p "${state_dir}"  # _update_emit_progress
+  export HIVE_UPDATE_STATE_FILE="${state_dir}/update-${update_id}.jsonl"  # _update_emit_progress
+  _update_emit_progress "start" "$(jq -cn --arg id "${update_id}" --argjson dry_run "${dry_run}" '{id: $id, dry_run: $dry_run}')"  # _update_emit_progress
+  _update_emit_progress "lock-acquired" "{}"  # _update_emit_progress
+  _update_emit_progress "staging-setup-complete" "$(jq -cn --arg path "${staging_dir}" '{path: $path}')"  # _update_emit_progress
+
+  metadata="${staging_dir}/current.json"
+  if ! _update_fetch_current_metadata "${metadata}"; then
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+  if [ "${inject_failure_after}" = "fetch" ]; then
+    echo "INJECTED FAILURE after fetch" >&2
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 99
+  fi
+
+  remote_version=$(jq -r '.version' "${metadata}")
+  remote_url=$(jq -r '.tarball_url' "${metadata}")
+  remote_sha=$(jq -r '.checksum_sha256' "${metadata}")
+
+  if local_version="$(_update_local_version 2>/dev/null)"; then
+    if _update_compare_versions "${local_version}" "${remote_version}"; then
+      update_available="false"  # _update_emit_progress
+      _update_emit_progress "compare-complete" "$(jq -cn --arg local_version "${local_version}" --arg remote_version "${remote_version}" --argjson update_available false '{local_version: $local_version, remote_version: $remote_version, update_available: $update_available}')"  # _update_emit_progress
+      echo "==> Already at v${local_version}; no update needed."
+      _update_emit_progress "done" "$(jq -cn --argjson success true --arg final_version "${remote_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+      return 0
+    fi
+    echo "==> Update available: v${local_version} → v${remote_version}"
+  else
+    echo "==> Update available: → v${remote_version}"
+  fi
+  _update_emit_progress "compare-complete" "$(jq -cn --arg local_version "${local_version}" --arg remote_version "${remote_version}" --argjson update_available "${update_available}" '{local_version: $local_version, remote_version: $remote_version, update_available: $update_available}')"  # _update_emit_progress
+
+  if ! _update_diskspace_check 209715200; then
+    _update_emit_progress "error" "$(jq -cn --arg step "diskspace-check" --arg error "insufficient disk space" '{step: $step, error: $error}')"  # _update_emit_progress
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+
+  tarball_path="${staging_dir}/$(basename "${remote_url}")"
+  if ! _update_download_tarball "${remote_url}" "${tarball_path}"; then
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+  if [ "${inject_failure_after}" = "download" ]; then
+    echo "INJECTED FAILURE after download" >&2
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 99
+  fi
+
+  if ! _update_verify_checksum "${tarball_path}" "${remote_sha}"; then
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+  if [ "${inject_failure_after}" = "verify" ]; then
+    echo "INJECTED FAILURE after verify" >&2
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 99
+  fi
+
+  if ! _update_extract_tarball "${tarball_path}" "${staging_dir}"; then
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+  if [ "${inject_failure_after}" = "extract" ]; then
+    echo "INJECTED FAILURE after extract" >&2
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 99
+  fi
+
+  if [ "${dry_run_mode}" -eq 1 ]; then
+    echo "==> --dry-run: metadata, disk space, tarball download, checksum, and extract validated."
+    echo "    Overlay/apply/finalize steps skipped; install root left untouched."
+    _update_stage_cleanup "${staging_dir}" || true
+    _update_emit_progress "done" "$(jq -cn --argjson success true --arg final_version "${remote_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 0
+  fi
+
+  preserve_baseline="${staging_dir}/preserve.baseline"
+  echo "==> Capturing PRESERVE_LIST baseline..."
+  if ! _update_preserve_list_hash_capture "${preserve_baseline}"; then
+    _update_emit_progress "error" "$(jq -cn --arg step "preserve-baseline-capture" --arg error "failed to capture PRESERVE_LIST baseline" '{step: $step, error: $error}')"  # _update_emit_progress
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+
+  if ! ts=$(_update_apply_overlay "${staging_dir}" | tail -1); then
+    echo "==> overlay apply failed; revert handled internally by _update_apply_overlay"
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+
+  if [ "${inject_failure_after}" = "apply" ]; then
+    echo "INJECTED FAILURE after overlay apply — invoking revert via shadow ts ${ts}" >&2
+    _update_revert_overlay "${ts}" "${staging_dir}/applied.list"
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 99
+  fi
+
+  if ! _update_post_overlay_finalize "${ts}" "${staging_dir}" "${preserve_baseline}"; then
+    echo "==> [full-flow] finalize failed — install state reverted OR shadows preserved for rollback"
+    _update_emit_progress "done" "$(jq -cn --argjson success false --arg final_version "${local_version}" '{success: $success, final_version: $final_version}')"  # _update_emit_progress
+    return 1
+  fi
+
+  if _update_v1_5_0_check_first_run_needed; then
+    if ! _update_v1_5_0_run_first_run_migration "${local_version}" "${remote_version}"; then
+      warn "v1.5.0 migration step failed - will retry on next update"
+    fi
+  fi
+
+  echo ""
+  echo "==> [full-flow] complete."
+  echo "    Updated: ${local_version:-<none>} → ${remote_version}"
+  echo "    Install verified (PRESERVE_LIST) and clean (shadows removed)."
+  echo "    Daemon restart: ${RESTART_STATUS}"
+  _update_emit_progress "done" "$(jq -cn --argjson success true --arg final_version "${remote_version}" --arg restart_status "${RESTART_STATUS}" '{success: $success, final_version: $final_version, restart_status: $restart_status}')"  # _update_emit_progress
+  return 0
+}
+
+_update_find_latest_shadow_ts() {
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local latest_ts=""
+  local manifest=""
+
+  latest_ts=$(find "${install_root}" -maxdepth 1 -name '.*.old.*' 2>/dev/null \
+    | sed -E 's|.*\.old\.||' \
+    | sort -ru \
+    | head -1)
+
+  if [ -z "${latest_ts}" ]; then
+    echo "ERROR: no .old.<ts> shadows found in ${install_root}" >&2
+    echo "       (no rollback target)" >&2
+    return 1
+  fi
+
+  manifest=$(find "${install_root}/.update-staging" -name 'applied.list' 2>/dev/null | sort | head -1)
+  if [ -z "${manifest}" ]; then
+    echo "ERROR: no applied.list manifest found under ${install_root}/.update-staging/" >&2
+    echo "       (cannot determine REPLACE_LIST order for rollback)" >&2
+    echo "       Manual recovery: walk ${install_root}/.<item>.old.${latest_ts} files yourself." >&2
+    return 1
+  fi
+
+  printf '%s\t%s\n' "${latest_ts}" "${manifest}"
+  return 0
+}
+
+_update_run_rollback() {
+  local explicit_manifest=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --manifest) explicit_manifest="$2"; shift 2 ;;
+      *) echo "ERROR: unknown arg '$1'" >&2; return 2 ;;
+    esac
+  done
+
+  echo "==> [rollback] start"
+
+  if ! _update_acquire_lock; then
+    return 1
+  fi
+  echo "    lock acquired"
+
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local ts=""
+  local manifest=""
+  local pair=""
+
+  if [ -n "${explicit_manifest}" ]; then
+    if [ ! -f "${explicit_manifest}" ]; then
+      echo "ERROR: explicit manifest not found: ${explicit_manifest}" >&2
+      return 1
+    fi
+    ts=$(find "${install_root}" -maxdepth 1 -name '.*.old.*' 2>/dev/null | sed -E 's|.*\.old\.||' | sort -ru | head -1)
+    manifest="${explicit_manifest}"
+  else
+    if ! pair="$(_update_find_latest_shadow_ts)"; then
+      return 1
+    fi
+    ts=$(printf '%s' "${pair}" | cut -f1)
+    manifest=$(printf '%s' "${pair}" | cut -f2)
+  fi
+
+  if [ -z "${ts}" ]; then
+    echo "ERROR: no .old.<ts> shadows found in ${install_root}" >&2
+    return 1
+  fi
+
+  echo "    rollback target ts: ${ts}"
+  echo "    manifest: ${manifest}"
+  echo ""
+
+  if ! _update_revert_overlay "${ts}" "${manifest}"; then
+    echo "==> Rollback completed with errors. Manual recovery may be needed." >&2
+    return 1
+  fi
+
+  echo ""
+  echo "==> [rollback] complete."
+  echo "    Restored from .old.${ts} shadows."
+  echo "    Cleanup of staging dir + remaining shadow artifacts is C.4's job (run hive doctor --fix when available)."
+  return 0
+}
+
+cmd_update_overlay_apply() {
+  local staging_dir="$1"
+  if [ -z "${staging_dir}" ]; then
+    echo "Usage: hive _update-overlay-apply <staging_dir>"
+    return 2
+  fi
+  if [ ! -d "${staging_dir}" ]; then
+    echo "ERROR: staging dir not found: ${staging_dir}" >&2
+    return 1
+  fi
+
+  local tarball=""
+  tarball=$(find "${staging_dir}" -maxdepth 1 -name '*.tar.gz' | head -1)
+  if [ -z "${tarball}" ]; then
+    echo "ERROR: no tarball found in ${staging_dir}" >&2
+    return 1
+  fi
+  echo "==> Tarball: ${tarball}"
+
+  if ! _update_extract_tarball "${tarball}" "${staging_dir}"; then
+    return 1
+  fi
+
+  local output=""
+  local ts=""
+  if ! output="$(_update_apply_overlay "${staging_dir}")"; then
+    printf '%s\n' "${output}"
+    echo "ERROR: overlay apply failed" >&2
+    return 1
+  fi
+  printf '%s\n' "${output}"
+  ts=$(printf '%s\n' "${output}" | tail -1)
+
+  echo ""
+  echo "==> _update-overlay-apply complete."
+  echo "    Timestamp: ${ts}"
+  echo "    To revert: hive _update-overlay-revert ${ts} ${staging_dir}/applied.list"
+  return 0
+}
+
+cmd_update_overlay_revert() {
+  local ts="$1"
+  local manifest="${2:-}"
+  if [ -z "${ts}" ]; then
+    echo "Usage: hive _update-overlay-revert <ts> [<manifest>]"
+    return 2
+  fi
+  _update_revert_overlay "${ts}" "${manifest}"
+}
+
+cmd_update_fetch_stage() {
+  local target_version=""
+  local dry_run=0
+  HIVE_UPDATE_STAGING_DIR=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --version)
+        target_version="${2:-}"
+        if [ -z "${target_version}" ]; then
+          echo "ERROR: --version requires a value" >&2
+          return 2
+        fi
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      current)
+        shift
+        ;;
+      -*)
+        echo "ERROR: unknown arg '$1'" >&2
+        return 2
+        ;;
+      *)
+        if [ -n "${target_version}" ]; then
+          echo "ERROR: multiple target versions specified" >&2
+          return 2
+        fi
+        target_version="$1"
+        shift
+        ;;
+    esac
+  done
+
+  echo "==> [_update-fetch-stage] start"
+
+  if ! _update_acquire_lock; then
+    echo "==> [_update-fetch-stage] aborting (lock failure)"
+    return 1
+  fi
+  echo "==> Lock acquired"
+
+  local staging_dir=""
+  if ! staging_dir="$(_update_stage_setup)"; then
+    echo "==> [_update-fetch-stage] aborting (staging setup failure)"
+    return 1
+  fi
+  echo "==> Staging dir: ${staging_dir}"
+  HIVE_UPDATE_STAGING_DIR="${staging_dir}"
+  trap '_update_stage_cleanup "${HIVE_UPDATE_STAGING_DIR}" || true' EXIT
+
+  local metadata="${staging_dir}/current.json"
+  if ! _update_fetch_current_metadata "${metadata}"; then
+    echo "==> [_update-fetch-stage] aborting (metadata fetch failure)"
+    return 1
+  fi
+  echo "==> Metadata fetched: ${metadata}"
+
+  local remote_version remote_url remote_sha
+  remote_version=$(jq -r '.version' "${metadata}")
+  remote_url=$(jq -r '.tarball_url' "${metadata}")
+  remote_sha=$(jq -r '.checksum_sha256' "${metadata}")
+
+  if [ -n "${target_version}" ] && [ "${target_version}" != "${remote_version}" ]; then
+    echo "ERROR: target version '${target_version}' does not match API current '${remote_version}'" >&2
+    return 1
+  fi
+
+  local local_version
+  if local_version="$(_update_local_version 2>/dev/null)"; then
+    echo "==> Local version: ${local_version}"
+    if _update_compare_versions "${local_version}" "${remote_version}"; then
+      echo "==> Already at v${local_version}; no update needed."
+      return 0
+    fi
+    echo "==> Update available: v${local_version} → v${remote_version}"
+  else
+    echo "==> Local version: (none)"
+    echo "==> Update available: → v${remote_version}"
+  fi
+
+  if [ "${dry_run}" -eq 1 ]; then
+    echo "==> --dry-run: not downloading. Exiting."
+    return 0
+  fi
+
+  if ! _update_diskspace_check 209715200; then
+    return 1
+  fi
+  echo "==> Disk-space pre-flight: ✓"
+
+  local tarball_path
+  tarball_path="${staging_dir}/$(basename "${remote_url}")"
+  if ! _update_download_tarball "${remote_url}" "${tarball_path}"; then
+    return 1
+  fi
+  echo "==> Tarball downloaded: ${tarball_path}"
+
+  if ! _update_verify_checksum "${tarball_path}" "${remote_sha}"; then
+    return 1
+  fi
+  echo "==> Checksum verified: ${remote_sha}"
+
+  echo ""
+  echo "==> [_update-fetch-stage] complete (C.1 boundary)."
+  echo "    Tarball staged at: ${tarball_path}"
+  echo "    Next leaf C.2 implements atomic-overlay swap."
+  return 0
+}
+
+cmd_update_full_flow() {
+  _update_run_full_flow_with_revert "$@"
+}
+
+cmd_update() {
+  # C.3 — rollback path
+  if [ "${1:-}" = "--rollback" ]; then
+    shift
+    _update_run_rollback "$@"
+    return $?
+  fi
+
+  # C.5 — API-based check-only mode
+  if [ "${1:-}" = "--check" ]; then
+    shift
+    _update_check "$@"
+    return $?
+  fi
+
+  # C.7 — deprecated v1.4.x self-exec flag (tarball install has no .git/, so
+  # post-pull self-exec is impossible). Strip and warn if seen.
+  # v1.5.10 — use ${arr[@]+"${arr[@]}"} idiom for safe empty-array expansion
+  # under `set -u`. macOS ships bash 3.2 which treats `${arr[@]}` of an empty
+  # array as unbound when nounset is active. Without args (the common case —
+  # just `hive update`), filtered_args is empty and the unsafe expansion
+  # raised "unbound variable" on Hetavi's Mac mini.
+  local filtered_args=()
+  for arg in "${@+"$@"}"; do
+    case "$arg" in
+      --internal-post-pull)
+        warn "--internal-post-pull is deprecated (v1.4.x flag, ignored on v1.5.0+)"
+        ;;
+      *) filtered_args+=("$arg") ;;
+    esac
+  done
+
+  # C.7 — main path: tarball-based full flow (replaces v1.4.9 git-pull body)
+  _update_run_full_flow_with_revert ${filtered_args[@]+"${filtered_args[@]}"}
+  return $?
+}
+
+cmd_bootstrap() {
+  cd "$HIVE_ROOT" || exit 1
+
+  if ! _dashboard_ensure_token; then
+    warn "Could not auto-ensure dashboard token. The dashboard will fail to start."
+    warn "Manual recovery: run 'hive dashboard token' to set HIVE_DASHBOARD_TOKEN."
+  fi
+
+  # Reconcile ecosystem-defined daemons. startOrReload is idempotent —
+  # starts new procs, reloads existing ones from latest config.
+  if [ -f ecosystem.config.cjs ]; then
+    info "Bootstrapping ecosystem-defined daemons..."
+    if pm2 startOrReload ecosystem.config.cjs --update-env >/dev/null 2>&1; then
+      pm2 save --force >/dev/null 2>&1
+      success "Ecosystem daemons reconciled."
+    else
+      error "pm2 startOrReload ecosystem.config.cjs failed."
+      error "Manual recovery: cd $HIVE_ROOT && pm2 startOrReload ecosystem.config.cjs && pm2 save"
+      return 1
+    fi
+  else
+    info "No ecosystem.config.cjs — skipping daemon reconcile."
+  fi
+
+  # Future hooks: bootstrap any other framework-required state here.
+  # E.g., missing config files with sensible defaults, missing dirs, etc.
+  # Keep idempotent.
+
+  return 0
+}
+
+# Helper: prompt user before applying a risky doctor fix.
+# Returns 0 (apply) only if user types y/Y interactively.
+# In --yes mode, returns 1 (skip) — risky fixes are never auto-applied.
+_doctor_confirm_fix() {
+  local desc="$1"
+  if [ "$auto_yes" = true ]; then
+    return 1  # don't auto-apply risky in --yes mode; just surface
+  fi
+  local reply
+  read -r -p "    Apply: $desc? [y/N]: " reply
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+# Per-agent expected config keys: <agent>|<key>|<default value>|<reason>
+# Future migrations append to this list.
+_expected_agent_keys() {
+  cat <<'EOF'
+house-md|announce_on_boot|true|Boot beacon required for delegation/wake auto-resume
+EOF
+}
+
+# Inject a key into an agent's block in the overlay YAML.
+# No-op if the key already exists under that agent.
+_overlay_inject_agent_key() {
+  local overlay="$1"
+  local agent="$2"
+  local key="$3"
+  local value="$4"
+  # Check if key already present under the agent's block.
+  if AGENT="$agent" KEY="$key" awk '
+    /^  / { if ($0 ~ "^  " ENVIRON["AGENT"] ":") in_block=1; else if ($0 ~ /^  [a-z]/) in_block=0 }
+    in_block && $0 ~ "^    " ENVIRON["KEY"] ":" { found=1; exit }
+    END { exit !found }
+  ' "$overlay"; then
+    return 0
+  fi
+  # Inject key: value at the end of the agent's block.
+  AGENT="$agent" KEY="$key" VALUE="$value" awk '
+    BEGIN { added=0; in_block=0 }
+    /^  / {
+      if (in_block && $0 ~ /^  [a-z]/ && !added) {
+        print "    " ENVIRON["KEY"] ": " ENVIRON["VALUE"]
+        added=1
+      }
+      if ($0 ~ "^  " ENVIRON["AGENT"] ":") in_block=1
+      else if ($0 ~ /^  [a-z]/) in_block=0
+    }
+    { print }
+    END {
+      if (in_block && !added) print "    " ENVIRON["KEY"] ": " ENVIRON["VALUE"]
+    }
+  ' "$overlay" > "$overlay.tmp" && mv "$overlay.tmp" "$overlay"
+}
+
+# v1.5.0 D.0a — structured doctor output for dashboard consumption.
+# `cmd_doctor --json` runs the same checks as text mode but additionally
+# captures each check's outcome via _doctor_record into an in-memory buffer,
+# then emits a JSON envelope to stdout instead of the trailing text summary.
+#
+# Locked envelope shape: see docs/v1.5.0-tasks/D.0a-doctor-json.md §Goal.
+# Locked status enum: pass | warn | fail | skip
+# Locked category enum: core | deps | auth | build | config | agent | strategic
+#
+# Existing text rendering is unchanged — _doctor_record runs in parallel,
+# called immediately after the printf/echo block so both modes always agree.
+#
+# `--json` is incompatible with `--fix` and `--fix-setup` (returns 2).
+DOCTOR_RECORDS=()
+DOCTOR_AGENTS=()
+DOCTOR_AGENT_RECORDS=()
+DOCTOR_CURRENT_AGENT=""
+
+_doctor_record() {
+  local id="$1"
+  local label="$2"
+  local category="$3"
+  local status="$4"
+  local detail="${5:-}"
+  local fix_hint="${6:-}"
+
+  case "${status}" in
+    pass|warn|fail|skip) ;;
+    *)
+      echo "WARN: _doctor_record received invalid status '${status}' for id '${id}'" >&2
+      status="warn"
+      ;;
+  esac
+
+  local record
+  record=$(jq -n -c \
+    --arg id "${id}" \
+    --arg label "${label}" \
+    --arg category "${category}" \
+    --arg status "${status}" \
+    --arg detail "${detail}" \
+    --arg fix_hint "${fix_hint}" \
+    '{
+       id: $id,
+       label: $label,
+       category: $category,
+       status: $status,
+       detail: (if $detail == "" then null else $detail end),
+       fix_hint: (if $fix_hint == "" then null else $fix_hint end)
+     }')
+
+  if [ -n "${DOCTOR_CURRENT_AGENT:-}" ]; then
+    DOCTOR_AGENT_RECORDS+=("${record}")
+  else
+    DOCTOR_RECORDS+=("${record}")
+  fi
+}
+
+_doctor_emit_json_envelope() {
+  local exit_code="$1"
+  local total=${#DOCTOR_RECORDS[@]}
+  local pass_count=0
+  local warn_count=0
+  local fail_count=0
+  local skip_count=0
+
+  for record in "${DOCTOR_RECORDS[@]}"; do
+    local rstatus
+    rstatus=$(echo "$record" | jq -r '.status')
+    case "$rstatus" in
+      pass) pass_count=$((pass_count + 1)) ;;
+      warn) warn_count=$((warn_count + 1)) ;;
+      fail) fail_count=$((fail_count + 1)) ;;
+      skip) skip_count=$((skip_count + 1)) ;;
+    esac
+  done
+
+  for agent_env in "${DOCTOR_AGENTS[@]}"; do
+    local count
+    count=$(echo "$agent_env" | jq '.checks | length')
+    local apass
+    local awarn
+    local afail
+    local askip
+    apass=$(echo "$agent_env" | jq '[.checks[] | select(.status == "pass")] | length')
+    awarn=$(echo "$agent_env" | jq '[.checks[] | select(.status == "warn")] | length')
+    afail=$(echo "$agent_env" | jq '[.checks[] | select(.status == "fail")] | length')
+    askip=$(echo "$agent_env" | jq '[.checks[] | select(.status == "skip")] | length')
+    total=$((total + count))
+    pass_count=$((pass_count + apass))
+    warn_count=$((warn_count + awarn))
+    fail_count=$((fail_count + afail))
+    skip_count=$((skip_count + askip))
+  done
+
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local checks_json
+  local agents_json
+  checks_json=$(printf '%s\n' "${DOCTOR_RECORDS[@]}" | jq -s '.')
+  agents_json=$(printf '%s\n' "${DOCTOR_AGENTS[@]}" | jq -s '.')
+
+  jq -n -c \
+    --arg ts "$ts" \
+    --argjson summary "$(jq -n \
+      --argjson total "$total" \
+      --argjson pass "$pass_count" \
+      --argjson warn "$warn_count" \
+      --argjson fail "$fail_count" \
+      --argjson skip "$skip_count" \
+      --argjson exit_code "$exit_code" \
+      '{total: $total, pass: $pass, warn: $warn, fail: $fail, skip: $skip, exit_code: $exit_code}')" \
+    --argjson checks "$checks_json" \
+    --argjson agents "$agents_json" \
+    '{
+       version: "1",
+       ts: $ts,
+       summary: $summary,
+       checks: $checks,
+       agents: $agents
+     }'
+}
+
+_doctor_check_tailscale_expose() {
+  local helper="${HIVE_ROOT}/scripts/tailscale-expose.sh"
+  local apply_fix="${1:-false}"
+  printf "  %-35s" "Tailscale expose"
+
+  if [ ! -x "${helper}" ]; then
+    echo -e "${YELLOW}WARN${RESET}  helper missing"
+    _doctor_record "tailscale-expose" "Tailscale expose" "strategic" "warn" "helper missing" ""
+    issues=$((issues + 1))
+    return
+  fi
+
+  if [ "${apply_fix}" = true ]; then
+    local output
+    # v1.5.23 — pass FORCE_REAPPLY=1 so the helper resets any stale/stuck serve
+    # config before re-applying. User explicitly asked for --fix-tailscale, so
+    # we honor that intent rather than no-op-ing on "already exposed".
+    output=$(FORCE_REAPPLY=1 "${helper}" 2>&1 || true)
+
+    local status="pass"
+    local summary="checked"
+    if printf '%s\n' "${output}" | grep -q 'FAILED to apply tailscale serve'; then
+      status="fail"
+      summary="tailscale serve failed"
+      echo -e "${RED}FAIL${RESET}  tailscale serve command failed — see output below"
+      issues=$((issues + 1))
+    elif printf '%s\n' "${output}" | grep -q 'WARNING: tailscale serve :443 already routes a different service'; then
+      status="warn"
+      summary="port conflict"
+      echo -e "${YELLOW}WARN${RESET}  tailscale serve :443 already routes a different service"
+      issues=$((issues + 1))
+    else
+      if printf '%s\n' "${output}" | grep -q 'already exposed at '; then
+        summary="already exposed"
+      elif printf '%s\n' "${output}" | grep -q 'tailscale CLI not found'; then
+        summary="tailscale unavailable"
+      elif printf '%s\n' "${output}" | grep -q 'tailscale not running'; then
+        summary="tailscale not running"
+      elif printf '%s\n' "${output}" | grep -q 'exposed at '; then
+        summary="exposed"
+      fi
+      echo -e "${GREEN}OK${RESET}"
+    fi
+
+    _doctor_record "tailscale-expose" "Tailscale expose" "strategic" "${status}" "${summary}" ""
+
+    if [ -n "${output}" ]; then
+      while IFS= read -r line; do
+        [ -n "${line}" ] || continue
+        printf '    %s\n' "${line}"
+      done <<EOF
+${output}
+EOF
+    fi
+    return
+  fi
+
+  # Read-only by default: report state without re-enabling exposure after a
+  # user intentionally ran `tailscale serve off`.
+  if ! command -v tailscale >/dev/null 2>&1; then
+    echo -e "${DIM}SKIP${RESET}  tailscale CLI not installed"
+    _doctor_record "tailscale-expose" "Tailscale expose" "strategic" "skip" "tailscale CLI not installed" "hive doctor --fix-tailscale"
+    return
+  fi
+
+  local status_json
+  status_json=$(tailscale status --json 2>/dev/null || true)
+  if ! printf '%s\n' "${status_json}" | grep -q '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+    echo -e "${DIM}SKIP${RESET}  tailscale not running"
+    _doctor_record "tailscale-expose" "Tailscale expose" "strategic" "skip" "tailscale not running" "hive doctor --fix-tailscale"
+    return
+  fi
+
+  local dns_name serve_json serve_target url
+  dns_name=""
+  if command -v jq >/dev/null 2>&1; then
+    dns_name=$(printf '%s\n' "${status_json}" | jq -r '.Self.DNSName // ""' 2>/dev/null || true)
+  elif command -v python3 >/dev/null 2>&1; then
+    dns_name=$(STATUS_JSON="${status_json}" python3 - <<'PY'
+import json
+import os
+
+try:
+    data = json.loads(os.environ.get("STATUS_JSON", ""))
+except Exception:
+    data = {}
+
+print(((data.get("Self") or {}).get("DNSName")) or "")
+PY
+)
+  fi
+  dns_name="${dns_name%.}"
+
+  serve_json=$(tailscale serve status --json 2>/dev/null || printf '{}\n')
+  serve_target=""
+  if command -v jq >/dev/null 2>&1; then
+    serve_target=$(SERVE_JSON="${serve_json}" jq -r '
+      [(.Web // {})[]?.Handlers["/"]?.Proxy | strings][0] // ""
+    ' 2>/dev/null <<<"${serve_json}" || true)
+  elif command -v python3 >/dev/null 2>&1; then
+    serve_target=$(SERVE_JSON="${serve_json}" python3 - <<'PY'
+import json
+import os
+
+try:
+    data = json.loads(os.environ.get("SERVE_JSON", ""))
+except Exception:
+    data = {}
+
+for web_target in (data.get("Web") or {}).values():
+    handlers = (web_target or {}).get("Handlers") or {}
+    proxy = (handlers.get("/") or {}).get("Proxy")
+    if isinstance(proxy, str) and proxy:
+        print(proxy)
+        raise SystemExit(0)
+
+print("")
+PY
+)
+  fi
+
+  url=""
+  if [ -n "${dns_name}" ]; then
+    url="https://${dns_name}/"
+  fi
+
+  if [ "${serve_target}" = "http://localhost:7777" ] || [ "${serve_target}" = "http://127.0.0.1:7777" ]; then
+    if [ -n "${url}" ]; then
+      echo -e "${GREEN}OK${RESET}  exposed at ${url}"
+      _doctor_record "tailscale-expose" "Tailscale expose" "strategic" "pass" "exposed at ${url}" ""
+    else
+      echo -e "${GREEN}OK${RESET}  exposed"
+      _doctor_record "tailscale-expose" "Tailscale expose" "strategic" "pass" "exposed" ""
+    fi
+  else
+    echo -e "${GREEN}OK${RESET}  not exposed (intentional; run 'hive doctor --fix-tailscale' to enable)"
+    _doctor_record "tailscale-expose" "Tailscale expose" "strategic" "pass" "not exposed (intentional; run 'hive doctor --fix-tailscale' to enable)" "hive doctor --fix-tailscale"
+  fi
+}
+
+# v1.5.18 — detect daemons running pre-update code. Compares each PM2 process's
+# start time against package.json's mtime; processes that started BEFORE the
+# version file was last modified are running stale code.
+_doctor_check_framework_version_drift() {
+  local install_root="${HIVE_INSTALL_ROOT:-$HOME/neato-hive}"
+  local version_file="${install_root}/package.json"
+  printf "  %-35s" "Framework version drift"
+
+  if [ ! -f "${version_file}" ]; then
+    echo -e "${YELLOW}WARN${RESET}  package.json missing"
+    _doctor_record "framework-version-drift" "Framework version drift" "strategic" "warn" "package.json missing" ""
+    issues=$((issues + 1))
+    return
+  fi
+
+  if ! command -v pm2 >/dev/null 2>&1; then
+    echo -e "${DIM}SKIP${RESET}  pm2 unavailable"
+    _doctor_record "framework-version-drift" "Framework version drift" "strategic" "skip" "pm2 unavailable" ""
+    return
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${DIM}SKIP${RESET}  jq unavailable"
+    _doctor_record "framework-version-drift" "Framework version drift" "strategic" "skip" "jq unavailable" ""
+    return
+  fi
+
+  # Get package.json mtime in epoch seconds (macOS stat -f, Linux stat -c)
+  local version_mtime
+  version_mtime=$(stat -f %m "${version_file}" 2>/dev/null || stat -c %Y "${version_file}" 2>/dev/null)
+  if [ -z "${version_mtime}" ]; then
+    echo -e "${DIM}SKIP${RESET}  stat unavailable"
+    _doctor_record "framework-version-drift" "Framework version drift" "strategic" "skip" "stat unavailable" ""
+    return
+  fi
+
+  # PM2 pm_uptime is in milliseconds; convert version_mtime to ms for comparison.
+  # Any process whose pm_uptime is LESS than version_mtime started before the
+  # current package.json — i.e. running pre-update code.
+  local version_mtime_ms=$((version_mtime * 1000))
+  local stale_names
+  stale_names=$(pm2 jlist 2>/dev/null | jq -r --argjson mtime "${version_mtime_ms}" \
+    '[.[] | select(.pm2_env.pm_uptime < $mtime) | .name] | join(", ")' 2>/dev/null || echo "")
+
+  if [ -z "${stale_names}" ]; then
+    echo -e "${GREEN}OK${RESET}  all daemons on current code"
+    _doctor_record "framework-version-drift" "Framework version drift" "strategic" "pass" "all daemons on current code" ""
+  else
+    local stale_count
+    stale_count=$(printf '%s' "${stale_names}" | awk -F, '{print NF}')
+    echo -e "${YELLOW}WARN${RESET}  ${stale_count} daemon(s) on stale code: ${stale_names}"
+    echo "    Fix: pm2 restart all --update-env && pm2 save"
+    _doctor_record "framework-version-drift" "Framework version drift" "strategic" "warn" "${stale_count} daemons on stale code: ${stale_names}" "pm2 restart all --update-env && pm2 save"
+    issues=$((issues + 1))
+  fi
+}
+
+cmd_doctor() {
+  local fix=false
+  local fix_tailscale=false
+  local auto_yes=false
+  local fix_setup=false
+  local json_mode=false
+
+  for arg in "$@"; do
+    case "$arg" in
+      --fix-setup) fix_setup=true ;;
+      --fix-tailscale) fix_tailscale=true ;;
+      --fix) fix=true ;;
+      --yes|-y) auto_yes=true ;;
+      --json) json_mode=true ;;
+      *) error "Unknown flag: $arg"; return 1 ;;
+    esac
+  done
+
+  if [ "$json_mode" = true ] && { [ "$fix" = true ] || [ "$fix_setup" = true ] || [ "$fix_tailscale" = true ]; }; then
+    echo "Error: --json cannot be combined with --fix, --fix-tailscale, or --fix-setup" >&2
+    return 2
+  fi
+
+  DOCTOR_RECORDS=()
+  DOCTOR_AGENTS=()
+  DOCTOR_AGENT_RECORDS=()
+  DOCTOR_CURRENT_AGENT=""
+
+  # --fix-setup runs a separate suite targeting setup wizard artifacts
+  # with interactive fix prompts. See doctor_fix_setup() below.
+  if [ "$fix_setup" = true ]; then
+    doctor_fix_setup
+    return $?
+  fi
+
+  # In --fix mode, run cmd_bootstrap first to reconcile ecosystem daemons.
+  # This means anyone running `hive doctor --fix` (whether from `hive update`
+  # post-sweep or manually) gets ecosystem reconciliation.
+  if [ "$fix" = true ]; then
+    cmd_bootstrap
+  fi
+
+  if [ "$json_mode" = true ]; then
+    exec 3>&1
+    exec 1>/dev/null
+  fi
+
+  header "Hive Doctor"
+  echo ""
+
+  local issues=0
+  local fixes=0
+
+  # 0a. Hive version
+  printf "  %-35s" "Hive version"
+  echo -e "${GREEN}OK${RESET} (v$(get_version))"
+  _doctor_record "hive-version" "Hive version" "core" "pass" "v$(get_version)" ""
+
+  # 0b. Up to date (v1.5.22 — release-manifest only, git check removed)
+  # The git-based check was reporting false positives on installs that had a
+  # git remote from an old clone-style install (pre-v1.5.8). `hive update`
+  # overlays release tarballs without touching git refs, so any clone-installed
+  # hive accumulates "git: behind by N commit(s)" warnings that don't reflect
+  # whether the user is on the latest published release. v1.5.22 drops the git
+  # path entirely and compares local package.json version against current.json
+  # from the release manifest. If local < remote → WARN. If local >= remote → OK.
+  printf "  %-35s" "Up to date"
+  local local_ver remote_ver api_url
+  local_ver="$(get_version)"
+  api_url="$(_update_default_api_url)"
+  remote_ver="$(curl -fsSL --max-time 5 "$api_url" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || echo '')"
+  if [ -z "$remote_ver" ]; then
+    echo -e "${YELLOW}WARN${RESET} (offline — couldn't reach website API)"
+    _doctor_record "up-to-date" "Up to date" "core" "warn" "offline" ""
+  elif [ "$local_ver" = "$remote_ver" ]; then
+    echo -e "${GREEN}OK${RESET} (v${local_ver} matches website)"
+    _doctor_record "up-to-date" "Up to date" "core" "pass" "v${local_ver} matches website" ""
+  elif _update_compare_versions "$local_ver" "$remote_ver"; then
+    # local < remote (update available)
+    echo -e "${YELLOW}WARN${RESET} (local v${local_ver}, website v${remote_ver} — run 'hive update')"
+    _doctor_record "up-to-date" "Up to date" "core" "warn" "local v${local_ver}, website v${remote_ver}" "hive update"
+  else
+    # local >= remote (e.g. local-ahead-of-website during release ceremony) — fine
+    echo -e "${GREEN}OK${RESET} (v${local_ver}, website v${remote_ver})"
+    _doctor_record "up-to-date" "Up to date" "core" "pass" "local v${local_ver} >= website v${remote_ver}" ""
+  fi
+
+  # 1. Node.js
+  printf "  %-35s" "Node.js installed"
+  if command -v node &>/dev/null; then
+    local node_ver
+    node_ver=$(node --version)
+    local major
+    major=$(echo "$node_ver" | sed 's/v//' | cut -d. -f1)
+    if [ "$major" -ge 18 ]; then
+      echo -e "${GREEN}OK${RESET} ($node_ver)"
+      _doctor_record "node-installed" "Node.js installed" "deps" "pass" "$node_ver" ""
+    else
+      echo -e "${RED}WARN${RESET} ($node_ver — need v18+)"
+      _doctor_record "node-installed" "Node.js installed" "deps" "warn" "$node_ver — need v18+" ""
+      issues=$((issues + 1))
+    fi
+  else
+    echo -e "${RED}FAIL${RESET}"
+    _doctor_record "node-installed" "Node.js installed" "deps" "fail" "" ""
+    issues=$((issues + 1))
+  fi
+
+  # 2. PM2
+  printf "  %-35s" "PM2 installed"
+  if command -v pm2 &>/dev/null; then
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "pm2-installed" "PM2 installed" "deps" "pass" "" ""
+  else
+    echo -e "${RED}FAIL${RESET} — install with: npm install -g pm2"
+    _doctor_record "pm2-installed" "PM2 installed" "deps" "fail" "" "npm install -g pm2"
+    issues=$((issues + 1))
+  fi
+
+  # 2b. Runtime prereqs (v1.5.11) — system tools the framework depends on
+  # at runtime. flock was added between v1.4.x and v1.5.x, so legacy installs
+  # that ran `hive update` without re-running setup.sh step 2 missed it.
+  # `hive update` now auto-installs these post-overlay, but doctor checks
+  # them too so users see the state without running update.
+  local _prereqs_os _prereqs_install_hint
+  _prereqs_os="$(uname -s 2>/dev/null || echo unknown)"
+  case "$_prereqs_os" in
+    Darwin) _prereqs_install_hint="brew install <pkg>" ;;
+    Linux)  _prereqs_install_hint="sudo apt-get install <pkg>" ;;
+    *)      _prereqs_install_hint="install <pkg> via your package manager" ;;
+  esac
+  for cmd in flock gh jq tmux pandoc sqlite3; do
+    printf "  %-35s" "$cmd installed"
+    if command -v "$cmd" &>/dev/null; then
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "prereq-$cmd" "$cmd installed" "deps" "pass" "" ""
+    else
+      echo -e "${YELLOW}WARN${RESET} — install with: $_prereqs_install_hint  (pkg: $cmd, or run 'hive update' to auto-install)"
+      _doctor_record "prereq-$cmd" "$cmd installed" "deps" "warn" "missing" "$_prereqs_install_hint $cmd"
+      issues=$((issues + 1))
+    fi
+  done
+
+  # 3. Claude CLI
+  printf "  %-35s" "Claude CLI installed"
+  if command -v claude &>/dev/null; then
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "claude-cli-installed" "Claude CLI installed" "deps" "pass" "" ""
+  else
+    echo -e "${RED}FAIL${RESET} — install from https://docs.anthropic.com/en/docs/claude-cli"
+    _doctor_record "claude-cli-installed" "Claude CLI installed" "deps" "fail" "" "install from https://docs.anthropic.com/en/docs/claude-cli"
+    issues=$((issues + 1))
+  fi
+
+  # 4. Claude CLI authenticated
+  printf "  %-35s" "Claude CLI authenticated"
+  if claude auth status &>/dev/null 2>&1; then
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "claude-cli-authenticated" "Claude CLI authenticated" "auth" "pass" "" ""
+  else
+    echo -e "${YELLOW}WARN${RESET} — run: claude setup-token"
+    _doctor_record "claude-cli-authenticated" "Claude CLI authenticated" "auth" "warn" "" "claude setup-token"
+    issues=$((issues + 1))
+  fi
+
+  # 4a. Claude auth type (API key vs subscription)
+  printf "  %-35s" "Claude auth type"
+  local auth_output
+  auth_output=$(claude auth status 2>&1 || true)
+  if echo "$auth_output" | grep -qi "api.key\|api_key\|apikey"; then
+    echo -e "${RED}FAIL${RESET} — using API key, not subscription"
+    echo -e "    ${DIM}Hive requires Claude MAX/Pro. Run: claude setup-token${RESET}"
+    _doctor_record "claude-auth-type" "Claude auth type" "auth" "fail" "using API key, not subscription" "claude setup-token"
+    issues=$((issues + 1))
+  else
+    echo -e "${GREEN}OK${RESET} (subscription)"
+    _doctor_record "claude-auth-type" "Claude auth type" "auth" "pass" "subscription" ""
+  fi
+
+  # 4b. ANTHROPIC_API_KEY conflict
+  printf "  %-35s" "No ANTHROPIC_API_KEY conflict"
+  local api_key_found=false
+  local api_key_locations=""
+
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    api_key_found=true
+    api_key_locations="environment"
+  fi
+
+  for rc_file in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.bash_profile"; do
+    if [ -f "$rc_file" ] && grep -q "ANTHROPIC_API_KEY" "$rc_file" 2>/dev/null; then
+      api_key_found=true
+      api_key_locations="${api_key_locations:+$api_key_locations, }$(basename "$rc_file")"
+    fi
+  done
+
+  if [ "$api_key_found" = true ]; then
+    echo -e "${RED}CONFLICT${RESET} — found in: $api_key_locations"
+    echo -e "    ${DIM}This overrides your subscription and causes billing errors.${RESET}"
+    echo -e "    ${DIM}Remove ANTHROPIC_API_KEY from your shell profile and restart your terminal.${RESET}"
+    _doctor_record "anthropic-api-key-conflict" "No ANTHROPIC_API_KEY conflict" "auth" "fail" "found in: $api_key_locations" "Remove ANTHROPIC_API_KEY from your shell profile and restart your terminal."
+    issues=$((issues + 1))
+  else
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "anthropic-api-key-conflict" "No ANTHROPIC_API_KEY conflict" "auth" "pass" "" ""
+  fi
+
+  # 5. Build exists
+  printf "  %-35s" "TypeScript compiled (dist/)"
+  if [ -f "$HIVE_ROOT/dist/index.js" ]; then
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "typescript-compiled" "TypeScript compiled (dist/)" "build" "pass" "" ""
+  else
+    echo -e "${RED}FAIL${RESET} — run: hive build"
+    _doctor_record "typescript-compiled" "TypeScript compiled (dist/)" "build" "fail" "" "hive build"
+    issues=$((issues + 1))
+  fi
+
+  # 6. Build freshness
+  printf "  %-35s" "Build is current"
+  if [ -f "$HIVE_ROOT/dist/index.js" ] && [ -d "$HIVE_ROOT/src" ]; then
+    local src_mod dist_mod
+    src_mod=$(find "$HIVE_ROOT/src" -name '*.ts' -newer "$HIVE_ROOT/dist/index.js" 2>/dev/null | head -1)
+    if [ -z "$src_mod" ]; then
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "build-current" "Build is current" "build" "pass" "" ""
+    else
+      echo -e "${YELLOW}STALE${RESET} — source changed since last build. Run: hive build"
+      _doctor_record "build-current" "Build is current" "build" "warn" "source changed since last build" "hive build"
+      issues=$((issues + 1))
+    fi
+  else
+    echo -e "${DIM}SKIP${RESET} (no build to check)"
+    _doctor_record "build-current" "Build is current" "build" "skip" "no build to check" ""
+  fi
+
+  # 7. .env exists
+  printf "  %-35s" ".env file exists"
+  if [ -f "$ENV_FILE" ]; then
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "env-file-exists" ".env file exists" "config" "pass" "" ""
+  else
+    echo -e "${RED}FAIL${RESET} — copy .env.example to .env and fill in values"
+    _doctor_record "env-file-exists" ".env file exists" "config" "fail" "" "copy .env.example to .env and fill in values"
+    issues=$((issues + 1))
+  fi
+
+  # 8. Owner ID set
+  printf "  %-35s" "DISCORD_OWNER_ID set"
+  if grep -q '^DISCORD_OWNER_ID=.' "$ENV_FILE" 2>/dev/null; then
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "discord-owner-id-set" "DISCORD_OWNER_ID set" "config" "pass" "" ""
+  else
+    echo -e "${RED}FAIL${RESET} — set your Discord user ID in .env"
+    _doctor_record "discord-owner-id-set" "DISCORD_OWNER_ID set" "config" "fail" "" "set your Discord user ID in .env"
+    issues=$((issues + 1))
+  fi
+
+  # 9. Install path matches allowed_paths in config
+  printf "  %-35s" "Install dir in allowed_paths"
+  local config_file="$HIVE_ROOT/config/config.yaml"
+  if [ -f "$config_file" ]; then
+    local path_ok=false
+    # Extract allowed_paths entries, expand ~ to $HOME, check if HIVE_ROOT matches
+    while IFS= read -r allowed; do
+      # Strip "    - " prefix and expand ~
+      local expanded="${allowed/#~/$HOME}"
+      if [ "$HIVE_ROOT" = "$expanded" ] || [[ "$HIVE_ROOT" == "$expanded"/* ]]; then
+        path_ok=true
+        break
+      fi
+    done < <(awk '/^  allowed_paths:/{flag=1; next} /^  [a-z]/{flag=0} flag && /^    - /{sub(/^    - /, ""); print}' "$config_file")
+
+    if [ "$path_ok" = true ]; then
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "install-dir-allowed-paths" "Install dir in allowed_paths" "config" "pass" "" ""
+    else
+      echo -e "${RED}MISMATCH${RESET}"
+      echo -e "    ${DIM}Hive is installed at: $HIVE_ROOT${RESET}"
+      echo -e "    ${DIM}But config/config.yaml allowed_paths doesn't include it.${RESET}"
+      echo -e "    ${DIM}Safety hooks will block writes. Fix:${RESET}"
+      local tilde_path="${HIVE_ROOT/#$HOME/~}"
+      echo -e "    ${DIM}  sed -i.bak 's|- ~/neato-hive|- $tilde_path|; s|- ~/hive|- $tilde_path|' '$config_file' && hive restart${RESET}"
+      _doctor_record "install-dir-allowed-paths" "Install dir in allowed_paths" "config" "fail" "config/config.yaml allowed_paths doesn't include $HIVE_ROOT" "sed -i.bak 's|- ~/neato-hive|- $tilde_path|; s|- ~/hive|- $tilde_path|' '$config_file' && hive restart"
+      issues=$((issues + 1))
+    fi
+  else
+    echo -e "${RED}FAIL${RESET} — config/config.yaml missing"
+    _doctor_record "install-dir-allowed-paths" "Install dir in allowed_paths" "config" "fail" "config/config.yaml missing" ""
+    issues=$((issues + 1))
+  fi
+
+  # 10. Check each agent
+  echo ""
+  echo -e "  ${BOLD}Agent Health:${RESET}"
+  for agent in $(list_agents); do
+    echo ""
+    echo -e "  ${CYAN}$agent${RESET}"
+    DOCTOR_CURRENT_AGENT="$agent"
+    DOCTOR_AGENT_RECORDS=()
+
+    # Bot token
+    local token_var
+    token_var="DISCORD_BOT_TOKEN_$(echo "$agent" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+    printf "    %-33s" "Bot token ($token_var)"
+    if grep -q "^${token_var}=." "$ENV_FILE" 2>/dev/null; then
+      echo -e "${GREEN}SET${RESET}"
+      _doctor_record "bot-token" "Bot token ($token_var)" "agent" "pass" "" ""
+    else
+      echo -e "${RED}MISSING${RESET}"
+      _doctor_record "bot-token" "Bot token ($token_var)" "agent" "fail" "" ""
+      issues=$((issues + 1))
+    fi
+
+    # Behavior directory
+    local bdir
+    bdir=$(agent_behavior_dir "$agent")
+    printf "    %-33s" "Behavior directory"
+    if [ -d "$bdir" ]; then
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "behavior-directory" "Behavior directory" "agent" "pass" "" ""
+    else
+      echo -e "${RED}MISSING${RESET} ($bdir)"
+      _doctor_record "behavior-directory" "Behavior directory" "agent" "fail" "$bdir" ""
+      issues=$((issues + 1))
+    fi
+
+    # Required files (v1.5.8) — only check files that are actually per-agent.
+    # CRITICAL-RULES.md lives in shared/, not per-agent — agents inherit from
+    # the shared file via the prompt builder. TOOLS.md is deprecated — agents
+    # inherit tools from config.yaml + their AGENTS.md. Both were stale checks
+    # that flagged every install as broken. Per-agent required minimum is
+    # IDENTITY + AGENTS + SOUL + USER (USER.md was added v1.4.7 for user-identity).
+    for required_file in IDENTITY.md AGENTS.md SOUL.md USER.md; do
+      printf "    %-33s" "  $required_file"
+      if [ -f "$bdir/$required_file" ]; then
+        echo -e "${GREEN}OK${RESET}"
+        case "$required_file" in
+          IDENTITY.md) _doctor_record "behavior-file-identity" "  $required_file" "agent" "pass" "" "" ;;
+          AGENTS.md) _doctor_record "behavior-file-agents" "  $required_file" "agent" "pass" "" "" ;;
+          SOUL.md) _doctor_record "behavior-file-soul" "  $required_file" "agent" "pass" "" "" ;;
+          USER.md) _doctor_record "behavior-file-user" "  $required_file" "agent" "pass" "" "" ;;
+        esac
+      else
+        echo -e "${YELLOW}MISSING${RESET}"
+        case "$required_file" in
+          IDENTITY.md) _doctor_record "behavior-file-identity" "  $required_file" "agent" "fail" "" "" ;;
+          AGENTS.md) _doctor_record "behavior-file-agents" "  $required_file" "agent" "fail" "" "" ;;
+          SOUL.md) _doctor_record "behavior-file-soul" "  $required_file" "agent" "fail" "" "" ;;
+          USER.md) _doctor_record "behavior-file-user" "  $required_file" "agent" "fail" "" "" ;;
+        esac
+        issues=$((issues + 1))
+      fi
+    done
+
+    # Advisory files (INFO only — not all agents have these)
+    for advisory_file in LESSONS.md MEMORY.md; do
+      printf "    %-33s" "  $advisory_file"
+      if [ -f "$bdir/$advisory_file" ]; then
+        echo -e "${GREEN}OK${RESET}"
+        case "$advisory_file" in
+          LESSONS.md) _doctor_record "behavior-file-lessons" "  $advisory_file" "agent" "pass" "" "" ;;
+          MEMORY.md) _doctor_record "behavior-file-memory" "  $advisory_file" "agent" "pass" "" "" ;;
+        esac
+      else
+        echo -e "${CYAN}INFO${RESET} (optional)"
+        case "$advisory_file" in
+          LESSONS.md) _doctor_record "behavior-file-lessons" "  $advisory_file" "agent" "warn" "optional" "" ;;
+          MEMORY.md) _doctor_record "behavior-file-memory" "  $advisory_file" "agent" "warn" "optional" "" ;;
+        esac
+      fi
+    done
+
+    # Memory directory
+    printf "    %-33s" "Memory directory"
+    if [ -d "$bdir/memory" ]; then
+      local mem_count
+      mem_count=$(ls "$bdir/memory/"*.md 2>/dev/null | wc -l | tr -d ' ')
+      echo -e "${GREEN}OK${RESET} ($mem_count daily file(s))"
+      _doctor_record "memory-directory" "Memory directory" "agent" "pass" "$mem_count daily file(s)" ""
+    else
+      echo -e "${YELLOW}MISSING${RESET}"
+      _doctor_record "memory-directory" "Memory directory" "agent" "fail" "" ""
+      issues=$((issues + 1))
+    fi
+
+    # PM2 process
+    printf "    %-33s" "PM2 process"
+    if pm2 describe "$agent" &>/dev/null; then
+      local pm2_status
+      pm2_status=$(pm2 jlist 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for p in data:
+    if p['name'] == '$agent':
+        print(p['pm2_env']['status'])
+        sys.exit(0)
+print('unknown')
+" 2>/dev/null || echo "unknown")
+      if [ "$pm2_status" = "online" ]; then
+        echo -e "${GREEN}ONLINE${RESET}"
+        _doctor_record "pm2-process" "PM2 process" "agent" "pass" "" ""
+      else
+        echo -e "${RED}${pm2_status}${RESET}"
+        _doctor_record "pm2-process" "PM2 process" "agent" "fail" "$pm2_status" ""
+        issues=$((issues + 1))
+      fi
+    else
+      echo -e "${RED}NOT RUNNING${RESET}"
+      _doctor_record "pm2-process" "PM2 process" "agent" "fail" "not running" ""
+      issues=$((issues + 1))
+    fi
+
+    local agent_status="pass"
+    for record in "${DOCTOR_AGENT_RECORDS[@]}"; do
+      local rstatus
+      rstatus=$(echo "$record" | jq -r '.status')
+      case "$rstatus" in
+        fail) agent_status="fail"; break ;;
+        warn) [ "$agent_status" = "pass" ] && agent_status="warn" ;;
+      esac
+    done
+
+    local agent_envelope
+    agent_envelope=$(jq -n -c \
+      --arg name "$agent" \
+      --arg status "$agent_status" \
+      --argjson checks "$(printf '%s\n' "${DOCTOR_AGENT_RECORDS[@]}" | jq -s '.')" \
+      '{name: $name, status: $status, checks: $checks}')
+    DOCTOR_AGENTS+=("$agent_envelope")
+    DOCTOR_CURRENT_AGENT=""
+  done
+
+  # ---------------------------------------------------------------------------
+  # Strategic checks (v1.4.1) — fleet, runner, config, plist, .env, behavior
+  # ---------------------------------------------------------------------------
+  echo ""
+  echo -e "  ${BOLD}Strategic Checks:${RESET}"
+  echo ""
+
+  # S1. Fleet drift — declared agents vs PM2
+  printf "  %-35s" "Fleet (declared vs PM2)"
+  local declared_agents pm2_agents missing_in_pm2 unexpected_in_pm2
+  declared_agents=$(list_agents | sort)
+  pm2_agents=$(pm2 jlist 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for p in data:
+    print(p['name'])
+" 2>/dev/null | sort)
+
+  missing_in_pm2=""
+  for a in $declared_agents; do
+    if ! echo "$pm2_agents" | grep -qx "$a"; then
+      missing_in_pm2="${missing_in_pm2:+$missing_in_pm2 }$a"
+    fi
+  done
+
+  # v1.5.8 — exclude all framework daemons (hive-runner, hive-dashboard) from
+  # the "unexpected in PM2" check. Daemons live in ecosystem.config.cjs, not
+  # in config.yaml's `agents:` block. Previously only hive-runner was excluded,
+  # so hive-dashboard was falsely flagged as "manually started? leftover?".
+  unexpected_in_pm2=""
+  for a in $pm2_agents; do
+    case "$a" in
+      hive-runner|hive-dashboard) continue ;;
+    esac
+    if ! echo "$declared_agents" | grep -qx "$a"; then
+      unexpected_in_pm2="${unexpected_in_pm2:+$unexpected_in_pm2 }$a"
+    fi
+  done
+
+  if [ -z "$missing_in_pm2" ] && [ -z "$unexpected_in_pm2" ]; then
+    echo -e "${GREEN}OK${RESET}"
+    _doctor_record "fleet-drift" "Fleet (declared vs PM2)" "strategic" "pass" "" ""
+  else
+    echo ""
+    _doctor_record "fleet-drift" "Fleet (declared vs PM2)" "strategic" "warn" "missing: ${missing_in_pm2:-none}; unexpected: ${unexpected_in_pm2:-none}" ""
+    for a in $missing_in_pm2; do
+      echo -e "    ${YELLOW}WARN${RESET}  Agent $a declared but not in PM2"
+      issues=$((issues + 1))
+      if [ "$fix" = true ]; then
+        info "    Starting $a in PM2..."
+        if pm2 start dist/index.js --name "$a" -- --agent "$a" >/dev/null 2>&1 && pm2 save --force >/dev/null 2>&1; then
+          success "    Fixed: $a added to PM2."
+          fixes=$((fixes + 1))
+          issues=$((issues - 1))
+        else
+          warn "    Could not start $a — check logs with: pm2 logs $a"
+        fi
+      fi
+    done
+    for a in $unexpected_in_pm2; do
+      echo -e "    ${CYAN}INFO${RESET}  PM2 has $a, not in config (manually started? leftover?)"
+      echo -e "    ${DIM}  Recommendation: pm2 delete $a && pm2 save${RESET}"
+    done
+  fi
+
+  # S2. Runner drift — hive-runner in PM2 and online
+  printf "  %-35s" "Runner (hive-runner)"
+  local runner_status
+  runner_status=$(pm2 jlist 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for p in data:
+    if p['name'] == 'hive-runner':
+        print(p['pm2_env']['status'])
+        sys.exit(0)
+print('missing')
+" 2>/dev/null || echo "missing")
+
+  case "$runner_status" in
+    online)
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "runner-drift" "Runner (hive-runner)" "strategic" "pass" "" ""
+      ;;
+    missing)
+      echo -e "${YELLOW}WARN${RESET}  hive-runner not in PM2 — autonomy layer is dormant."
+      _doctor_record "runner-drift" "Runner (hive-runner)" "strategic" "warn" "hive-runner not in PM2 — autonomy layer is dormant." ""
+      issues=$((issues + 1))
+      if [ "$fix" = true ]; then
+        info "    Starting hive-runner via ecosystem.config.cjs..."
+        if pm2 startOrReload ecosystem.config.cjs --only hive-runner >/dev/null 2>&1 && pm2 save --force >/dev/null 2>&1; then
+          success "    Fixed: hive-runner started."
+          fixes=$((fixes + 1))
+          issues=$((issues - 1))
+        else
+          warn "    Could not start hive-runner — check ecosystem.config.cjs"
+        fi
+      fi
+      ;;
+    *)
+      echo -e "${YELLOW}WARN${RESET}  hive-runner status: $runner_status"
+      _doctor_record "runner-drift" "Runner (hive-runner)" "strategic" "warn" "hive-runner status: $runner_status" ""
+      issues=$((issues + 1))
+      if [ "$fix" = true ]; then
+        info "    Restarting hive-runner..."
+        if pm2 restart hive-runner >/dev/null 2>&1; then
+          success "    Fixed: hive-runner restarted."
+          fixes=$((fixes + 1))
+          issues=$((issues - 1))
+        else
+          warn "    Could not restart hive-runner — check: pm2 logs hive-runner"
+        fi
+      fi
+      ;;
+  esac
+
+  # S2b. Dashboard drift — hive-dashboard in PM2 and online (v1.5.0+ ecosystem daemon)
+  printf "  %-35s" "Dashboard (hive-dashboard)"
+  local dashboard_status
+  dashboard_status=$(pm2 jlist 2>/dev/null | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for p in data:
+        if p.get('name') == 'hive-dashboard':
+            print(p.get('pm2_env', {}).get('status', 'unknown'))
+            break
+    else:
+        print('missing')
+except Exception:
+    print('error')
+" 2>/dev/null | head -n1 || echo "missing")
+
+  case "$dashboard_status" in
+    online)
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "dashboard-drift" "Dashboard (hive-dashboard)" "strategic" "pass" "" ""
+      ;;
+    missing)
+      echo -e "${YELLOW}WARN${RESET}  hive-dashboard not in PM2 — local dashboard at :7777 unreachable."
+      _doctor_record "dashboard-drift" "Dashboard (hive-dashboard)" "strategic" "warn" "hive-dashboard not in PM2" "hive bootstrap"
+      issues=$((issues + 1))
+      if [ "$fix" = true ]; then
+        info "    Starting hive-dashboard via ecosystem.config.cjs..."
+        if pm2 startOrReload ecosystem.config.cjs --only hive-dashboard >/dev/null 2>&1 && pm2 save --force >/dev/null 2>&1; then
+          success "    Fixed: hive-dashboard started."
+          fixes=$((fixes + 1))
+          issues=$((issues - 1))
+        else
+          warn "    Could not start hive-dashboard — check ecosystem.config.cjs"
+        fi
+      fi
+      ;;
+    *)
+      echo -e "${YELLOW}WARN${RESET}  hive-dashboard status: $dashboard_status"
+      _doctor_record "dashboard-drift" "Dashboard (hive-dashboard)" "strategic" "warn" "hive-dashboard status: $dashboard_status" ""
+      issues=$((issues + 1))
+      if [ "$fix" = true ]; then
+        info "    Restarting hive-dashboard..."
+        if pm2 restart hive-dashboard >/dev/null 2>&1; then
+          success "    Fixed: hive-dashboard restarted."
+          fixes=$((fixes + 1))
+          issues=$((issues - 1))
+        else
+          warn "    Could not restart hive-dashboard — check: pm2 logs hive-dashboard"
+        fi
+      fi
+      ;;
+  esac
+
+  _doctor_check_tailscale_expose "$fix_tailscale"
+
+  _doctor_check_framework_version_drift
+
+  # S3. Config schema drift — expected keys per agent
+  local overlay="$HIVE_ROOT/config/agents.local.yaml"
+  local schema_ok=true
+  while IFS='|' read -r s3_agent s3_key s3_default s3_reason; do
+    [ -n "$s3_agent" ] || continue
+    printf "  %-35s" "Config ($s3_agent/$s3_key)"
+
+    # Determine config source: prefer overlay, fall back to config.yaml
+    local s3_source=""
+    if [ -f "$overlay" ] && grep -q "^  ${s3_agent}:" "$overlay" 2>/dev/null; then
+      s3_source="$overlay"
+    elif grep -q "^  ${s3_agent}:" "$HIVE_ROOT/config/config.yaml" 2>/dev/null; then
+      s3_source="$HIVE_ROOT/config/config.yaml"
+    fi
+
+    if [ -z "$s3_source" ]; then
+      # Agent not in any config — Check 1 territory
+      echo -e "${DIM}SKIP${RESET} (agent not in config)"
+      _doctor_record "config-$(echo "$s3_agent" | tr '[:upper:]' '[:lower:]')-$(echo "$s3_key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')" "Config ($s3_agent/$s3_key)" "strategic" "skip" "agent not in config" ""
+      continue
+    fi
+
+    # Check if key exists in the agent's block
+    if AGENT="$s3_agent" KEY="$s3_key" awk '
+      /^  / { if ($0 ~ "^  " ENVIRON["AGENT"] ":") in_block=1; else if ($0 ~ /^  [a-z]/) in_block=0 }
+      in_block && $0 ~ "^    " ENVIRON["KEY"] ":" { found=1; exit }
+      END { exit !found }
+    ' "$s3_source"; then
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "config-$(echo "$s3_agent" | tr '[:upper:]' '[:lower:]')-$(echo "$s3_key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')" "Config ($s3_agent/$s3_key)" "strategic" "pass" "" ""
+    else
+      echo -e "${YELLOW}WARN${RESET}  $s3_agent is missing $s3_key (expected: $s3_default) — $s3_reason"
+      _doctor_record "config-$(echo "$s3_agent" | tr '[:upper:]' '[:lower:]')-$(echo "$s3_key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')" "Config ($s3_agent/$s3_key)" "strategic" "warn" "$s3_agent is missing $s3_key (expected: $s3_default) — $s3_reason" ""
+      issues=$((issues + 1))
+      schema_ok=false
+      if [ "$fix" = true ]; then
+        if [ ! -f "$overlay" ]; then
+          # Legacy install: user never ran `hive config migrate-agents`, so
+          # the overlay doesn't exist yet. Auto-run the migrator — it's
+          # safe non-interactively (no prompts, refuses to overwrite an
+          # existing overlay, always backs up config.yaml first). Owner
+          # waiver: silently performing this migration is acceptable.
+          info "    Overlay missing — auto-running 'hive config migrate-agents' to seed it..."
+          local s3_migrator_out
+          if s3_migrator_out=$(cmd_config_migrate_agents 2>&1); then
+            if [ -f "$overlay" ] && grep -q "^  ${s3_agent}:" "$overlay" 2>/dev/null; then
+              info "    Migrator created overlay. Injecting $s3_key: $s3_default into $s3_agent block..."
+              _overlay_inject_agent_key "$overlay" "$s3_agent" "$s3_key" "$s3_default"
+              success "    Fixed: $s3_key added to $s3_agent in agents.local.yaml (overlay seeded via migrate-agents)."
+              fixes=$((fixes + 1))
+              issues=$((issues - 1))
+            else
+              warn "    Migrator ran but overlay or $s3_agent block missing — skipping auto-fix."
+              warn "    Migrator output:"
+              echo "$s3_migrator_out" | sed 's/^/      /'
+            fi
+          else
+            warn "    'hive config migrate-agents' failed (exit $?). Skipping auto-fix for $s3_agent."
+            warn "    Migrator output:"
+            echo "$s3_migrator_out" | sed 's/^/      /'
+          fi
+        elif ! grep -q "^  ${s3_agent}:" "$overlay" 2>/dev/null; then
+          # Overlay exists but missing this agent's block. The migrator
+          # refuses to run when the overlay exists (would overwrite an
+          # operator-curated file), so this case stays manual. Rare —
+          # implies the operator hand-crafted the overlay and skipped
+          # this agent — but worth a clear breadcrumb when it fires.
+          warn "    Agent $s3_agent has a block in config.yaml but not in $overlay."
+          warn "    Auto-fix unavailable: 'hive config migrate-agents' refuses to overwrite an existing overlay."
+          warn "    Manual: copy the $s3_agent block from config/config.yaml into agents.local.yaml, then re-run 'hive doctor --fix'."
+        else
+          info "    Injecting $s3_key: $s3_default into $s3_agent block..."
+          _overlay_inject_agent_key "$overlay" "$s3_agent" "$s3_key" "$s3_default"
+          success "    Fixed: $s3_key added to $s3_agent in agents.local.yaml."
+          fixes=$((fixes + 1))
+          issues=$((issues - 1))
+        fi
+      fi
+    fi
+  done < <(_expected_agent_keys)
+
+  # S4. Plist drift (macOS-only) — launchd plist matches $USER and $PM2_HOME
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    printf "  %-35s" "Plist (PM2 boot persistence)"
+    local plist
+    plist=$(ls "$HOME/Library/LaunchAgents/"pm2.*.plist 2>/dev/null | head -1)
+    if [ -z "$plist" ]; then
+      echo -e "${YELLOW}WARN${RESET}  PM2 boot persistence plist not installed — agents won't auto-start after Mac restart."
+      echo -e "    ${DIM}Run: pm2 unstartup launchd && pm2 startup (paste the sudo command it emits)${RESET}"
+      _doctor_record "plist-pm2-boot-persistence" "Plist (PM2 boot persistence)" "strategic" "warn" "PM2 boot persistence plist not installed — agents won't auto-start after Mac restart." "pm2 unstartup launchd && pm2 startup"
+      issues=$((issues + 1))
+    else
+      local plist_user plist_home
+      plist_user=$(plutil -extract UserName raw -o - "$plist" 2>/dev/null || echo "")
+      plist_home=$(plutil -extract EnvironmentVariables.PM2_HOME raw -o - "$plist" 2>/dev/null || echo "")
+      if [ "$plist_user" = "$USER" ] && [ "$plist_home" = "$HOME/.pm2" ]; then
+        echo -e "${GREEN}OK${RESET}"
+        _doctor_record "plist-pm2-boot-persistence" "Plist (PM2 boot persistence)" "strategic" "pass" "" ""
+      else
+        echo -e "${YELLOW}WARN${RESET}  Plist installed but UserName=$plist_user / PM2_HOME=$plist_home — won't load on boot."
+        echo -e "    ${DIM}Run: pm2 unstartup launchd && pm2 startup (paste the sudo command it emits)${RESET}"
+        _doctor_record "plist-pm2-boot-persistence" "Plist (PM2 boot persistence)" "strategic" "warn" "Plist installed but UserName=$plist_user / PM2_HOME=$plist_home — won't load on boot." "pm2 unstartup launchd && pm2 startup"
+        issues=$((issues + 1))
+      fi
+    fi
+  fi
+
+  # S5. .env drift — keys in .env.example marked === REQUIRED === but missing in user's .env.
+  # v1.5.9 — section-aware parsing. .env.example uses === REQUIRED ===, === OPTIONAL ===,
+  # and === DEPRECATED === section markers. Only REQUIRED keys WARN if missing.
+  # OPTIONAL keys (1Password, dashboard bridge, etc.) are silent unless the user
+  # sets one and forgets a paired one (e.g. OP_SERVICE_ACCOUNT_TOKEN without OP_VAULT_NAME —
+  # future polish). DEPRECATED keys (DISCORD_OWNER_ID, DISCORD_AUTHORIZED_USERS — moved
+  # to config/users.local.yaml in v1.4.7) are silent and the user should NOT set them.
+  printf "  %-35s" ".env key coverage"
+  if [ -f "$HIVE_ROOT/.env.example" ] && [ -f "$ENV_FILE" ]; then
+    local env_required env_present env_missing_keys env_pair_warnings env_warning_summary
+    local -a env_optional_key_pairs
+    env_optional_key_pairs=(
+      "OP_SERVICE_ACCOUNT_TOKEN:OP_VAULT_NAME"
+    )
+    env_required=$(awk '
+      /^#.*=== *REQUIRED *===/  { section="required"; next }
+      /^#.*=== *OPTIONAL *===/  { section="optional"; next }
+      /^#.*=== *DEPRECATED *===/ { section="deprecated"; next }
+      section == "required" && /^[A-Z_]+=/ { sub(/=.*/, ""); print }
+    ' "$HIVE_ROOT/.env.example" | sort)
+    env_present=$(grep -E '^[A-Z_]+=' "$ENV_FILE" | cut -d= -f1 | sort)
+    env_missing_keys=$(comm -23 <(echo "$env_required") <(echo "$env_present"))
+    env_pair_warnings=""
+    local env_pair env_left_key env_right_key env_left_set env_right_set
+    for env_pair in "${env_optional_key_pairs[@]}"; do
+      env_left_key="${env_pair%%:*}"
+      env_right_key="${env_pair##*:}"
+      if grep -qE "^${env_left_key}=.+" "$ENV_FILE"; then
+        env_left_set=1
+      else
+        env_left_set=0
+      fi
+      if grep -qE "^${env_right_key}=.+" "$ENV_FILE"; then
+        env_right_set=1
+      else
+        env_right_set=0
+      fi
+
+      if [ "$env_left_set" -ne "$env_right_set" ]; then
+        if [ "$env_left_set" -eq 1 ]; then
+          env_pair_warnings="${env_pair_warnings}${env_left_key} requires ${env_right_key} also set"$'\n'
+        else
+          env_pair_warnings="${env_pair_warnings}${env_right_key} requires ${env_left_key} also set"$'\n'
+        fi
+      fi
+    done
+
+    env_warning_summary="$(printf "%s\n%s" "$env_missing_keys" "$env_pair_warnings" | sed '/^$/d')"
+    if [ -z "$env_warning_summary" ]; then
+      echo -e "${GREEN}OK${RESET}"
+      _doctor_record "env-key-coverage" ".env key coverage" "strategic" "pass" "" ""
+    else
+      echo ""
+      _doctor_record "env-key-coverage" ".env key coverage" "strategic" "warn" "$(echo "$env_warning_summary" | paste -sd ',' - | sed 's/,/, /g')" ""
+      while IFS= read -r mkey; do
+        [ -n "$mkey" ] || continue
+        echo -e "    ${YELLOW}WARN${RESET}  .env missing required key $mkey"
+        echo -e "    ${DIM}  Add ${mkey}=<value> to your .env. See .env.example for context.${RESET}"
+        issues=$((issues + 1))
+      done <<< "$env_missing_keys"
+      while IFS= read -r pair_warning; do
+        [ -n "$pair_warning" ] || continue
+        echo -e "    ${YELLOW}WARN${RESET}  ${pair_warning}"
+        issues=$((issues + 1))
+      done <<< "$env_pair_warnings"
+    fi
+  else
+    echo -e "${DIM}SKIP${RESET} (.env.example or .env not found)"
+    _doctor_record "env-key-coverage" ".env key coverage" "strategic" "skip" ".env.example or .env not found" ""
+  fi
+
+  local final_exit="$issues"
+  if [ "$issues" -gt 0 ]; then
+    final_exit=1
+  fi
+
+  if [ "$json_mode" = true ]; then
+    exec 1>&3
+    exec 3>&-
+    _doctor_emit_json_envelope "$final_exit"
+    return "$final_exit"
+  fi
+
+  # Summary
+  echo ""
+  if [ "$fixes" -gt 0 ]; then
+    success "Fixed $fixes issue(s)."
+  fi
+  if [ "$issues" -eq 0 ]; then
+    success "All checks passed. Hive is healthy."
+  else
+    warn "$issues issue(s) found."
+  fi
+  echo ""
+  if [ "$final_exit" != "$issues" ]; then
+    return "$final_exit"
+  fi
+  return "$issues"
+}
+
+# ---------------------------------------------------------------------------
+# doctor_fix_setup — diagnose and offer to fix stuck setup wizard state
+# ---------------------------------------------------------------------------
+#
+# Runs checks targeting the setup wizard's artifacts (.env, .setup-state,
+# config.yaml allowed_paths, Claude/gcloud/op CLIs, PM2 house-md process).
+# For each failure, prompts the user interactively before applying the fix.
+#
+# Add new known-issue checks here by calling check_and_fix with:
+#   check_and_fix "<name>" <bool_check_cmd> <fix_cmd> <fix_description>
+#
+# Invoked via: hive doctor --fix-setup
+
+doctor_fix_setup() {
+  header "Hive Doctor — Setup Recovery"
+  echo ""
+  echo -e "${DIM}Diagnosing setup wizard state. Each failing check prompts for an interactive fix.${RESET}"
+  echo ""
+
+  local issues=0
+  local fixes_applied=0
+
+  # Helper — run one check + interactive fix
+  check_and_fix() {
+    local name="$1"
+    local check_cmd="$2"
+    local fix_cmd="$3"
+    local issue_desc="$4"
+
+    printf "  %-42s" "$name"
+    if eval "$check_cmd" &>/dev/null; then
+      echo -e "${GREEN}OK${RESET}"
+      return 0
+    fi
+
+    echo -e "${RED}FAIL${RESET}"
+    issues=$((issues + 1))
+    echo -e "    ${DIM}Issue:${RESET} $issue_desc"
+    echo -e "    ${DIM}Fix:${RESET}   $fix_cmd"
+    local reply
+    read -r -p "    Apply fix now? [y/N]: " reply
+    if [[ "$reply" =~ ^[Yy] ]]; then
+      if eval "$fix_cmd"; then
+        success "Fixed."
+        fixes_applied=$((fixes_applied + 1))
+      else
+        warn "Fix command exited non-zero — check output above."
+      fi
+    else
+      info "Skipped. Run manually when ready."
+    fi
+    echo ""
+  }
+
+  # --- Check 1: .setup-state present ---
+  # If present, wizard was interrupted. Recommend resume rather than run other checks.
+  if [ -f "$HIVE_ROOT/.setup-state" ]; then
+    local last_step
+    last_step=$(grep '^last_step=' "$HIVE_ROOT/.setup-state" 2>/dev/null | cut -d= -f2)
+    warn "Incomplete setup detected — .setup-state says last completed step was $last_step."
+    echo ""
+    echo "Before running other fixes, you should either resume or restart setup:"
+    echo "  Resume:   cd $HIVE_ROOT && ./setup.sh --resume"
+    echo "  Restart:  cd $HIVE_ROOT && ./setup.sh --fresh"
+    echo ""
+    local reply
+    read -r -p "Continue with individual checks anyway? [y/N]: " reply
+    if [[ ! "$reply" =~ ^[Yy] ]]; then
+      echo "Done. Re-run setup to continue from where it stopped."
+      return 1
+    fi
+    echo ""
+  fi
+
+  # --- Check 2: .env exists and has Discord credentials ---
+  check_and_fix \
+    ".env has Discord bot token" \
+    "[ -f '$ENV_FILE' ] && grep -q '^DISCORD_BOT_TOKEN_HOUSE_MD=.\\+' '$ENV_FILE'" \
+    "cd '$HIVE_ROOT' && ./setup.sh --resume" \
+    ".env missing or DISCORD_BOT_TOKEN_HOUSE_MD not set. Resume setup to complete Step 6 (Discord)."
+
+  check_and_fix \
+    ".env has Discord owner ID" \
+    "grep -q '^DISCORD_OWNER_ID=[0-9]\\+' '$ENV_FILE'" \
+    "cd '$HIVE_ROOT' && ./setup.sh --resume" \
+    "DISCORD_OWNER_ID not set in .env."
+
+  # --- Check 3: Claude CLI installed ---
+  check_and_fix \
+    "Claude CLI installed" \
+    "command -v claude" \
+    "curl -fsSL https://claude.ai/install.sh | bash" \
+    "claude CLI not found in PATH."
+
+  # --- Check 4: Claude CLI authed with subscription (not API key) ---
+  check_and_fix \
+    "Claude CLI authenticated (subscription)" \
+    "claude auth status 2>&1 | grep -qiv 'api.key\\|api_key\\|apikey' && claude auth status" \
+    "claude setup-token" \
+    "Claude not authed, or authed with API key instead of subscription. Hive requires MAX/Pro."
+
+  # --- Check 5: gcloud virtualenv bug (Hently's failure mode) ---
+  # gcloud's brew cask needs 'virtualenv' pip package; Homebrew's Python 3.13
+  # doesn't ship it by default. Symptom: `gcloud --version` errors or
+  # `/opt/homebrew/share/google-cloud-sdk/bin/gcloud config virtualenv create`
+  # fails with "virtualenv: command not found".
+  if command -v gcloud &>/dev/null; then
+    check_and_fix \
+      "gcloud virtualenv bootstrap" \
+      "gcloud --version" \
+      "/opt/homebrew/opt/python@3.13/libexec/bin/python -m pip install --user virtualenv && brew reinstall --cask gcloud-cli" \
+      "gcloud runs but errors on virtualenv. Homebrew Python is missing the virtualenv pip package."
+  fi
+
+  # --- Check 6: gws (Google Workspace CLI) — optional, only flag if gcloud is present ---
+  if command -v gcloud &>/dev/null; then
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      check_and_fix \
+        "gws CLI installed (optional)" \
+        "command -v gws" \
+        "brew install googleworkspace-cli" \
+        "gws CLI not installed. Needed if agents use Google Workspace (Drive/Sheets/Gmail)."
+    else
+      # Linux — no fix command, just warn
+      if ! command -v gws &>/dev/null; then
+        printf "  %-42s" "gws CLI installed (optional)"
+        echo -e "${YELLOW}MISSING${RESET}"
+        echo -e "    ${DIM}Install the Go binary from: https://github.com/googleworkspaceplatform/google-workspace-cli/releases${RESET}"
+        echo ""
+      fi
+    fi
+  fi
+
+  # --- Check 7: OP_SERVICE_ACCOUNT_TOKEN validates ---
+  if [ -f "$ENV_FILE" ] && grep -q '^OP_SERVICE_ACCOUNT_TOKEN=.\+' "$ENV_FILE"; then
+    # Extract token and vault name from .env
+    local op_token op_vault
+    op_token=$(grep '^OP_SERVICE_ACCOUNT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
+    op_vault=$(grep '^OP_VAULT_NAME=' "$ENV_FILE" | cut -d= -f2-)
+    check_and_fix \
+      "1Password SA token validates" \
+      "OP_SERVICE_ACCOUNT_TOKEN='$op_token' op vault list" \
+      "echo 'Open https://*.1password.com → Developer Tools → Service Accounts → verify token + vault access'" \
+      "OP_SERVICE_ACCOUNT_TOKEN is set but fails to authenticate. Token may be revoked or wrong format."
+
+    if [ -n "$op_vault" ]; then
+      check_and_fix \
+        "1Password vault '$op_vault' accessible" \
+        "OP_SERVICE_ACCOUNT_TOKEN='$op_token' op vault list 2>/dev/null | grep -qw '$op_vault'" \
+        "echo 'Grant the service account Read+Write access to vault \"$op_vault\" in the 1P web UI.'" \
+        "Service account authenticates but cannot see vault '$op_vault'."
+    fi
+  fi
+
+  # --- Check 8: config.yaml allowed_paths includes install dir ---
+  if [ -f "$CONFIG_FILE" ]; then
+    local install_dir_tilde="${HIVE_ROOT/#$HOME/~}"
+    check_and_fix \
+      "config.yaml allows writes to install dir" \
+      "grep -qE '^    - (${install_dir_tilde//\//\\/}|${HIVE_ROOT//\//\\/})$' '$CONFIG_FILE'" \
+      "sed -i.bak -E 's|^(    - )(~/neato-hive|~/hive)\$|\\1${install_dir_tilde}|' '$CONFIG_FILE' && rm -f '$CONFIG_FILE.bak'" \
+      "Install directory not in allowed_paths. Safety hooks will block writes."
+  fi
+
+  # --- Check 9: dist/ build artifact exists ---
+  check_and_fix \
+    "Build artifact present (dist/index.js)" \
+    "[ -f '$HIVE_ROOT/dist/index.js' ]" \
+    "cd '$HIVE_ROOT' && npm install --silent && npm run build" \
+    "dist/index.js is missing. Hive cannot start without a build."
+
+  # --- Check 10: PM2 running + house-md process online ---
+  check_and_fix \
+    "PM2 daemon running" \
+    "pm2 ping &>/dev/null && pm2 list &>/dev/null" \
+    "pm2 resurrect 2>/dev/null || pm2 start '$HIVE_ROOT/dist/index.js' --name house-md -- --agent house-md" \
+    "PM2 is not running."
+
+  check_and_fix \
+    "house-md process online" \
+    "pm2 jlist 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(p['name']=='house-md' and p['pm2_env']['status']=='online' for p in d) else 1)\"" \
+    "pm2 restart house-md 2>/dev/null || pm2 start '$HIVE_ROOT/dist/index.js' --name house-md -- --agent house-md" \
+    "house-md is not online. Logs: pm2 logs house-md --lines 30 --nostream"
+
+  # --- Summary ---
+  echo ""
+  if [ "$issues" -eq 0 ]; then
+    success "All setup checks passed. Hive is ready."
+    return 0
+  fi
+
+  if [ "$fixes_applied" -gt 0 ]; then
+    info "$fixes_applied fix(es) applied out of $issues issue(s). Re-run 'hive doctor --fix-setup' to verify."
+  else
+    warn "$issues issue(s) found. None auto-fixed. Apply manually or re-run with [y] at each prompt."
+  fi
+  echo ""
+  return 1
+}
+
+cmd_env() {
+  header ".env Status"
+  echo ""
+
+  if [ ! -f "$ENV_FILE" ]; then
+    error ".env file not found at $ENV_FILE"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+    local key value
+    key="${line%%=*}"
+    value="${line#*=}"
+
+    printf "  %-40s" "$key"
+    if [ -n "$value" ]; then
+      # Mask the value — show first 6 chars then ***
+      local masked
+      if [ "${#value}" -gt 6 ]; then
+        masked="${value:0:6}***"
+      else
+        masked="***"
+      fi
+      echo -e "${GREEN}SET${RESET} (${DIM}${masked}${RESET})"
+    else
+      echo -e "${RED}EMPTY${RESET}"
+    fi
+  done < "$ENV_FILE"
+  echo ""
+}
+
+# v1.5.0 D.4 — `hive dashboard <subcommand>` CLI for managing the dashboard
+# auth token. Subcommands:
+#
+#   hive dashboard token         — print HIVE_DASHBOARD_TOKEN; generate if missing
+#   hive dashboard rotate-token  — regenerate, write to .env, print PM2-reload banner
+#
+# PM2 ban: NEITHER subcommand calls `pm2 restart`/`pm2 reload`. Banner instructs
+# the owner to run the restart manually. Same pattern as C.7's migration handler.
+#
+# See docs/v1.5.0-tasks/D.4-backups-tasks-runner-events.md for full contract.
+_dashboard_env_file() {
+  echo "${HIVE_INSTALL_ROOT:-$HOME/neato-hive}/.env"
+}
+
+# v1.5.0 D-followup — silent token-ensure helper. Used by:
+#   - cmd_bootstrap (auto-generates if missing before daemon reconcile)
+#   - _dashboard_print_token (delegates to this for the generate path)
+#
+# Idempotent: no-op when token already present in .env.
+# Silent: no echo, no info, no warn on success. Token never written to stdout/logs.
+# Returns 0 on success (already present OR newly generated), 1 on openssl failure.
+#
+# See docs/v1.5.0-tasks/D-followup-bootstrap-auto-token.md for full contract.
+_dashboard_ensure_token() {
+  local env_file
+  env_file="$(_dashboard_env_file)"
+
+  if [ -f "${env_file}" ] && grep -qE '^HIVE_DASHBOARD_TOKEN=' "${env_file}"; then
+    return 0
+  fi
+
+  if [ ! -f "${env_file}" ]; then
+    touch "${env_file}"
+  fi
+
+  local token
+  if ! token="$(openssl rand -hex 32 2>/dev/null)" || [ -z "${token}" ]; then
+    error "openssl rand -hex 32 failed — cannot ensure dashboard token"
+    return 1
+  fi
+
+  printf '\nHIVE_DASHBOARD_TOKEN=%s\n' "${token}" >> "${env_file}"
+
+  return 0
+}
+
+_dashboard_print_token() {
+  local env_file
+  env_file="$(_dashboard_env_file)"
+
+  if [ -f "${env_file}" ] && grep -qE '^HIVE_DASHBOARD_TOKEN=' "${env_file}"; then
+    grep -E '^HIVE_DASHBOARD_TOKEN=' "${env_file}" | head -1 | sed 's/^HIVE_DASHBOARD_TOKEN=//'
+    return 0
+  fi
+
+  if ! _dashboard_ensure_token; then
+    return 1
+  fi
+
+  grep -E '^HIVE_DASHBOARD_TOKEN=' "${env_file}" | head -1 | sed 's/^HIVE_DASHBOARD_TOKEN=//'
+  echo ""
+  info "Token added to ${env_file}."
+  info "Run 'pm2 restart hive-dashboard' to apply (the dashboard process must restart to read the new env var)."
+  return 0
+}
+
+_dashboard_rotate_token() {
+  local env_file
+  env_file="$(_dashboard_env_file)"
+
+  if [ ! -f "${env_file}" ]; then
+    touch "${env_file}"
+  fi
+
+  local token
+  if ! token="$(openssl rand -hex 32 2>/dev/null)" || [ -z "${token}" ]; then
+    error "openssl rand -hex 32 failed — cannot rotate token"
+    return 1
+  fi
+
+  if grep -qE '^HIVE_DASHBOARD_TOKEN=' "${env_file}"; then
+    if [ "$(uname)" = "Darwin" ]; then
+      sed -i '' "s|^HIVE_DASHBOARD_TOKEN=.*|HIVE_DASHBOARD_TOKEN=${token}|" "${env_file}"
+    else
+      sed -i "s|^HIVE_DASHBOARD_TOKEN=.*|HIVE_DASHBOARD_TOKEN=${token}|" "${env_file}"
+    fi
+  else
+    printf '\nHIVE_DASHBOARD_TOKEN=%s\n' "${token}" >> "${env_file}"
+  fi
+
+  echo "${token}"
+  echo ""
+  echo "  ┌──────────────────────────────────────────────────────────────────┐"
+  echo "  │  Token rotated.                                                  │"
+  echo "  │                                                                  │"
+  echo "  │  To apply, restart the dashboard process:                        │"
+  echo "  │      pm2 restart hive-dashboard                                  │"
+  echo "  │                                                                  │"
+  echo "  │  Until you do, the running dashboard still honors the OLD token. │"
+  echo "  │  Existing browser sessions using the old token will start        │"
+  echo "  │  failing 401 once the restart completes.                         │"
+  echo "  └──────────────────────────────────────────────────────────────────┘"
+  return 0
+}
+
+cmd_dashboard() {
+  local sub="${1:-}"
+  shift || true
+
+  case "${sub}" in
+    token)
+      _dashboard_print_token "$@"
+      return $?
+      ;;
+    rotate-token)
+      _dashboard_rotate_token "$@"
+      return $?
+      ;;
+    "")
+      error "Usage: hive dashboard <token|rotate-token>"
+      return 2
+      ;;
+    *)
+      error "Unknown subcommand: ${sub}. Available: token, rotate-token"
+      return 2
+      ;;
+  esac
+}
+
+cmd_config() {
+  local sub="${1:-show}"
+  case "$sub" in
+    migrate-agents)
+      shift
+      cmd_config_migrate_agents "$@"
+      return $?
+      ;;
+    show|"")
+      ;;
+    help|--help|-h)
+      header "hive config — configuration management"
+      echo ""
+      echo "  hive config            Show current configuration."
+      echo "  hive config show       Same as above."
+      echo "  hive config migrate-agents"
+      echo "                         Move your agents from config/config.yaml into the"
+      echo "                         gitignored config/agents.local.yaml. Run this once"
+      echo "                         on each Hive installation to make \`git pull\` and"
+      echo "                         \`hive update\` permanently safe for your agent set."
+      echo ""
+      return 0
+      ;;
+    *)
+      error "Unknown config subcommand: $sub"
+      cmd_config help
+      return 1
+      ;;
+  esac
+
+  header "Hive Configuration"
+  echo -e "${DIM}$CONFIG_FILE${RESET}"
+  echo ""
+
+  if [ ! -f "$CONFIG_FILE" ]; then
+    error "Config file not found at $CONFIG_FILE"
+    return 1
+  fi
+
+  local local_overlay="$HIVE_ROOT/config/agents.local.yaml"
+  if [ -f "$local_overlay" ]; then
+    echo -e "  ${BOLD}Local agents overlay:${RESET} ${GREEN}active${RESET} (${DIM}${local_overlay}${RESET})"
+  else
+    echo -e "  ${BOLD}Local agents overlay:${RESET} ${DIM}not present — using committed agents only${RESET}"
+    echo -e "  ${DIM}Run \`hive config migrate-agents\` to make your agent set safe from git pulls.${RESET}"
+  fi
+  echo ""
+
+  # Model
+  local model
+  model=$(grep '^model:' "$CONFIG_FILE" | awk '{print $2}')
+  echo -e "  ${BOLD}Model:${RESET} $model"
+
+  # Codex
+  local codex_enabled
+  codex_enabled=$(awk '/^codex:/{found=1} found && /enabled:/{print $2; exit}' "$CONFIG_FILE")
+  echo -e "  ${BOLD}Codex MCP:${RESET} $codex_enabled"
+
+  # Agents
+  echo -e "\n  ${BOLD}Agents:${RESET}"
+  for agent in $(list_agents); do
+    local channels coding
+    channels=$(agent_channels "$agent" | paste -sd, -)
+    coding=$(agent_coding_backend "$agent")
+    [ -n "$coding" ] && coding=" [${coding}]" || coding=""
+    echo "    $agent → #$channels$coding"
+  done
+
+  # Safety
+  echo -e "\n  ${BOLD}Blocked Commands:${RESET} $(grep -c '^\s*- "' "$CONFIG_FILE" 2>/dev/null | head -1) pattern(s)"
+  echo -e "  ${BOLD}Allowed Paths:${RESET}"
+  awk '/^  allowed_paths:/{found=1; next} found && /^  [a-z]/{exit} found && /- /{gsub(/^.*- /,"    "); print}' "$CONFIG_FILE"
+  echo -e "  ${BOLD}Protected Paths:${RESET}"
+  awk '/^  protected_paths:/{found=1; next} found && /^  [a-z]/{exit} found && /- /{gsub(/^.*- /,"    "); print}' "$CONFIG_FILE"
+  echo ""
+}
+
+cmd_config_migrate_agents() {
+  local migrator="$HIVE_ROOT/dist/cli/config-migrate-agents.js"
+  if [ ! -f "$migrator" ]; then
+    error "Migration script not built. Run: hive build"
+    return 1
+  fi
+  cd "$HIVE_ROOT" || return 1
+  node "$migrator" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# task — autonomy-v1 subcommands (PR 2a: launch only)
+# ---------------------------------------------------------------------------
+cmd_task() {
+  local sub="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$sub" in
+    launch)
+      local launcher="$HIVE_ROOT/dist/cli/task-launch.js"
+      if [ ! -f "$launcher" ]; then
+        error "Task launcher not built. Run: hive build"
+        exit 1
+      fi
+      cd "$HIVE_ROOT" || exit 1
+      node "$launcher" "$@"
+      ;;
+    status)
+      local status_cli="$HIVE_ROOT/dist/cli/task-status.js"
+      if [ ! -f "$status_cli" ]; then
+        error "Task status CLI not built. Run: hive build"
+        exit 1
+      fi
+      cd "$HIVE_ROOT" || exit 1
+      node "$status_cli" "$@"
+      ;;
+    help|--help|-h|"")
+      header "hive task — long-running task management"
+      echo ""
+      echo "  hive task launch --agent <name> --kind <codex|claude|shell> --cmd \"...\""
+      echo "                    [--on-complete \"<prompt>\"] [--on-failure \"<prompt>\"]"
+      echo "                    [--timeout <minutes>] [--reply-to <agent>:<task_id>]"
+      echo "                    [--delegated-by <agent>]"
+      echo ""
+      echo "  hive task status <task-id>"
+      echo "      Print the full event chain for a task with relative timestamps."
+      echo ""
+      echo "  Writes a task file at agents/<name>/tasks/<task_id>.md and prints the task_id."
+      echo "  The hive-runner daemon picks it up on the next polling sweep (~2s) and spawns"
+      echo "  the child process. Watch progress with:"
+      echo ""
+      echo "    tail -f data/runner-events.log"
+      echo ""
+      echo "  PR 2a is observable-only — auto-wake on completion lands in PR 2b."
+      ;;
+    *)
+      error "Unknown task subcommand: $sub"
+      echo ""
+      cmd_task help
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Main router
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    help|--help|-h)       cmd_help ;;
+    version|--version|-v) cmd_version ;;
+    status)               cmd_status ;;
+    list|ls)              cmd_list ;;
+    info)                 cmd_info "$@" ;;
+    start)                cmd_start "$@" ;;
+    stop)                 cmd_stop "$@" ;;
+    restart)              cmd_restart "$@" ;;
+    logs|log)             cmd_logs "$@" ;;
+    newsession)           cmd_newsession "$@" ;;
+    session)              cmd_session "$@" ;;
+    build)                cmd_build ;;
+    _update-fetch-stage)  cmd_update_fetch_stage "$@" ;;
+    _update-overlay-apply) cmd_update_overlay_apply "$@" ;;
+    _update-overlay-revert) cmd_update_overlay_revert "$@" ;;
+    _update-full-flow)    cmd_update_full_flow "$@" ;;
+    update)               cmd_update "$@" ;;
+    dashboard)            cmd_dashboard "$@" ;;
+    bootstrap)            cmd_bootstrap "$@" ;;
+    doctor)               cmd_doctor "$@" ;;
+    env)                  cmd_env ;;
+    config)               cmd_config "$@" ;;
+    task)                 cmd_task "$@" ;;
+    *)
+      error "Unknown command: $cmd"
+      echo ""
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

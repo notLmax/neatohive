@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agents - Hive Dashboard</title>
+  <link rel="stylesheet" href="/css/dashboard.css">
+</head>
+<body>
+  <script type="module">
+    import { ensureSession } from '/js/auth.js';
+    import { apiFetch, apiPing } from '/js/api.js';
+    import { renderShell, setShellVersion } from '/js/shell.js';
+    import { renderAgents } from '/js/pages/agents.js';
+
+    if (await ensureSession()) {
+      const isAuthorized = await apiPing();
+      if (isAuthorized) {
+        const main = renderShell({ activePage: '/agents.html', title: 'Agents' });
+        renderAgents(main);
+
+        apiFetch('/api/health')
+          .then((response) => (response.ok ? response.json() : null))
+          .then((payload) => setShellVersion(payload ? payload.version : 'unknown'))
+          .catch(() => setShellVersion('unknown'));
+      }
+    }
+  </script>
+</body>
+</html>

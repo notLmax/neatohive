@@ -40,7 +40,7 @@ The wizard will not install these. Do this first.
 - **Claude Max subscription** (5x or 20x) — Pro, Free, and Team Standard will not work for 24/7 agent usage. You'll authenticate during setup with `claude setup-token`.
 - **Discord account + your own Discord server** (or admin rights on one). Each agent is a bot + a channel.
 - **Discord Developer Portal access** — [discord.com/developers/applications](https://discord.com/developers/applications). You'll create one bot per agent.
-- **GitHub account** — you need repo access to `anthonyconnelly/neato-hive`. Ask AC to add you.
+- **GitHub account** — the repo is public at `notLmax/neatohive`, no access request needed.
 - **Your Discord User ID** — enable Developer Mode in Discord (Settings → Advanced → Developer Mode), then right-click your name and "Copy User ID". The wizard asks for this.
 
 ### Optional (the wizard will prompt you)
@@ -54,8 +54,8 @@ The wizard will not install these. Do this first.
 ## Install
 
 ```bash
-git clone https://github.com/anthonyconnelly/neato-hive.git
-cd neato-hive
+git clone https://github.com/notLmax/neatohive.git
+cd neatohive
 ./setup.sh
 ```
 
@@ -434,5 +434,3 @@ Existing installs: `hive update` will pull the fixed hook code and rebuild. No m
 - Coding agent template — Codex/Claude Code CLI workflow
 - Generalist agent template
 - Codex MCP integration for coding agents
-#   n e a t o h i v e  
- 

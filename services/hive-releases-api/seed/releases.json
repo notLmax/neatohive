@@ -1,0 +1,10 @@
+{
+  "current": {
+    "version": "1.5.0",
+    "tarball_url": "https://neato-hive-site.vercel.app/releases/v1.5.0/neato-hive-v1.5.0.tar.gz",
+    "checksum_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "released_at": "2026-05-06T00:00:00Z",
+    "changelog_url": "https://neato-hive-site.vercel.app/changelog.html"
+  },
+  "history": []
+}
